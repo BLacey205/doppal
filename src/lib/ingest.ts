@@ -1,0 +1,188 @@
+/**
+ * The one funnel every message goes through.
+ *
+ * Paste box, `POST /api/inbound-email`, the sample inbox — they all call
+ * `ingestEmail()`. That is the seam a forwarding address or a Gmail/Outlook OAuth
+ * sync plugs into later: build the same input shape and the rest of the pipeline
+ * (rank → extract → draft → store) is already done.
+ *
+ * Order matters: dates are found first so the importance score can count them.
+ *
+ * Nothing here sends anything. Drafts only.
+ */
+import type { AiStatus, StoredEmail, StorageStatus } from "~/lib/inbox-types";
+import { aiStatus, draftReply, extractDates, rankImportance, type EmailForAi } from "~/lib/ai";
+import { fromStructured, parseRawEmail, snippetOf } from "~/lib/email-parse";
+import {
+  insertCalendarEvent,
+  insertEmail,
+  saveDraft,
+  storageStatus,
+  type QueryExecutor,
+} from "~/lib/inbox-server";
+
+export type IngestSource = "paste" | "api" | "sample";
+
+export type IngestInput = {
+  source: IngestSource;
+  /** Raw message text (headers optional). Used by the paste box and samples. */
+  raw?: string;
+  /** Structured fields — the shape a webhook or an OAuth sync would send. */
+  from?: string;
+  subject?: string;
+  text?: string;
+  receivedAt?: string;
+};
+
+export type IngestResult =
+  | { ok: true; email: StoredEmail; storage: StorageStatus; ai: AiStatus }
+  | { ok: false; message: string; storage: StorageStatus };
+
+const EMPTY_MESSAGE =
+  "That doesn't look like a message yet — paste the text of the email (the From and Subject lines help too) and try again.";
+
+export async function ingestEmail(
+  input: IngestInput,
+  exec?: QueryExecutor,
+): Promise<IngestResult> {
+  const status = storageStatus();
+  const ai = aiStatus();
+
+  const parsed = input.raw
+    ? parseRawEmail(input.raw, input.receivedAt)
+    : fromStructured({
+        from: input.from,
+        subject: input.subject,
+        text: input.text,
+        receivedAt: input.receivedAt,
+      });
+
+  if (!parsed.body.trim() && (!parsed.subject || parsed.subject === "(no subject)")) {
+    return { ok: false, message: EMPTY_MESSAGE, storage: status };
+  }
+
+  const forAi: EmailForAi = {
+    fromLabel: parsed.fromLabel,
+    fromEmail: parsed.fromEmail,
+    subject: parsed.subject,
+    body: parsed.body,
+    receivedAt: parsed.receivedAt,
+  };
+
+  // 1. dates (so the score can count them)  2. importance  3. draft
+  const dates = await extractDates(forAi);
+  const importance = await rankImportance(forAi, dates.value.length);
+  const draft = await draftReply(forAi, {
+    needsReply: importance.value.needsReply,
+    dates: dates.value,
+  });
+
+  const storedDates = dates.value.map((candidate) => ({
+    ...candidate,
+    mode: dates.mode,
+    provider: dates.provider,
+  }));
+
+  const inserted = await insertEmail(
+    {
+      source: input.source,
+      fromName: parsed.fromName,
+      fromEmail: parsed.fromEmail,
+      fromLabel: parsed.fromLabel,
+      subject: parsed.subject,
+      snippet: snippetOf(parsed.body),
+      body: parsed.body,
+      raw: input.raw ?? JSON.stringify({ from: input.from, subject: input.subject }),
+      receivedAt: parsed.receivedAt,
+      score: importance.value.score,
+      reason: importance.value.reason,
+      needsReply: importance.value.needsReply,
+      aiMode: importance.mode,
+      aiProvider: importance.provider,
+      datesJson: JSON.stringify(storedDates),
+    },
+    exec,
+  );
+
+  if (!inserted.ok) return { ok: false, message: inserted.message, storage: inserted.storage };
+
+  const savedDraft = await saveDraft(
+    {
+      emailId: inserted.value.id,
+      body: draft.value.body,
+      mode: draft.mode,
+      provider: draft.provider,
+      label: draft.label,
+      note: draft.note,
+    },
+    exec,
+  );
+  if (!savedDraft.ok) console.error("[ingest] draft could not be stored:", savedDraft.message);
+
+  const email: StoredEmail = {
+    id: inserted.value.id,
+    source: input.source,
+    fromName: parsed.fromName,
+    fromEmail: parsed.fromEmail,
+    fromLabel: parsed.fromLabel,
+    subject: parsed.subject,
+    snippet: snippetOf(parsed.body),
+    body: parsed.body,
+    receivedAt: parsed.receivedAt,
+    receivedAtLabel: formatReceived(parsed.receivedAt),
+    importance: importance.value,
+    aiMode: importance.mode,
+    aiProvider: importance.provider,
+    dates: storedDates,
+    draft: savedDraft.ok ? savedDraft.value : null,
+  };
+
+  return { ok: true, email, storage: inserted.storage, ai };
+}
+
+/**
+ * Put one of the dates we found into the calendar, with its reminder.
+ * Idempotent per (email, date) so a double click doesn't duplicate the event.
+ */
+export async function addDateToCalendar(
+  email: StoredEmail,
+  candidateId: string,
+  exec?: QueryExecutor,
+): Promise<{ ok: true; title: string; reminder: string } | { ok: false; message: string }> {
+  const candidate = email.dates.find((date) => date.id === candidateId);
+  if (!candidate) return { ok: false, message: "We couldn't find that date any more — reload the email." };
+  if (candidate.added) return { ok: true, title: candidate.label, reminder: candidate.reminderLabel };
+
+  const title = `${email.subject === "(no subject)" ? "Email" : email.subject} — ${candidate.label}`;
+  const result = await insertCalendarEvent(
+    {
+      emailId: email.id,
+      candidateId: candidate.id,
+      title: title.slice(0, 200),
+      startsAt: candidate.startsAt,
+      allDay: candidate.allDay,
+      reminderAt: candidate.reminderAt,
+      reminderLabel: candidate.reminderLabel,
+      reminderMinutes: candidate.reminderMinutes,
+      sourceLabel: `${email.fromLabel} · ${email.subject}`.slice(0, 200),
+    },
+    exec,
+  );
+
+  if (!result.ok) return { ok: false, message: result.message };
+  return { ok: true, title, reminder: candidate.reminderLabel };
+}
+
+function formatReceived(iso: string): string {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return "Unknown";
+  return `${new Intl.DateTimeFormat("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "UTC",
+  }).format(new Date(ms))} UTC`;
+}
