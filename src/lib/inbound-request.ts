@@ -4,7 +4,8 @@
  * `handleInboundEmailPost()` is the whole of `POST /api/inbound-email`: gate the
  * caller, read a capped body, hand the payload to the same `ingestEmail()` funnel as
  * the paste box, and answer with typed JSON. `src/routes/api/inbound-email.ts` is a
- * thin wrapper around it, and the provider webhook reuses `ingestToResponse()`.
+ * thin wrapper around it, and the provider webhook reuses `ingestToOutcome()`
+ * so its duplicate suppression can act on what actually happened.
  *
  * Order of checks, and why:
  *   1. rate limit  — cheapest flood guard, applies even to unauthenticated callers
@@ -14,7 +15,8 @@
  *
  * Nothing here sends mail. Drafts only.
  */
-import type { StoredEmail } from "~/lib/inbox-types";
+import type { StoredEmail, StorageStatus } from "~/lib/inbox-types";
+import type { QueryExecutor } from "~/lib/inbox-server";
 import {
   authorizeInboundRequest,
   failureResponse,
@@ -42,6 +44,12 @@ export type IngestOptions = {
   extra?: Record<string, unknown>;
   /** Override the owner alert (tests). Defaults to `~/lib/notify`. */
   notify?: AlertNotifier;
+  /**
+   * Inject a query executor (tests). Production passes nothing and the funnel
+   * uses its real store; the option exists only so the route logic can be
+   * exercised hermetically, including a store that refuses.
+   */
+  exec?: QueryExecutor;
 };
 
 const defaultNotifier: AlertNotifier = (email) =>
@@ -68,24 +76,66 @@ function queueAlert(email: StoredEmail, injected?: AlertNotifier): void {
 const INGEST_FAILED_MESSAGE =
   "We couldn't process that message just now. Nothing was stored — please try again.";
 
-/** Run one message through the funnel and turn the outcome into the route's JSON. */
-export async function ingestToResponse(
+/**
+ * What one ingest actually did, made explicit for callers that must act on the
+ * outcome. `ingestToResponse()` used to be the whole seam: it returned only a
+ * Response, so a caller could not tell a real store from a refused one or from
+ * the in-memory preview fallback without parsing its own JSON — and the provider
+ * webhook's duplicate suppression had to guess, which is how a message id came
+ * to be remembered before (and regardless of whether) the message was stored.
+ */
+export type IngestOutcome = {
+  /** The answer for the caller, worded exactly as `ingestToResponse` words it. */
+  response: Response;
+  /** True only when the funnel's store step succeeded and a message exists. */
+  ingested: boolean;
+  /**
+   * Where the row landed: "database" only when a real insert came back;
+   * "memory" for honest preview or for a fallback after the store refused;
+   * null when nothing was stored at all. The fact `storage.state` cannot
+   * carry — a memory fallback while a database is configured reports a
+   * database-y status — lives here instead.
+   */
+  storedIn: "database" | "memory" | null;
+  /** What the storage line said at the moment of the store. */
+  storageState: StorageStatus["state"] | null;
+};
+
+/** Run one message through the funnel and return both the answer and the facts. */
+export async function ingestToOutcome(
   input: InboundFields,
   options: IngestOptions = {},
-): Promise<Response> {
+): Promise<IngestOutcome> {
   const text = (value: unknown) => (typeof value === "string" ? value : "");
 
   try {
     const { ingestEmail } = await import("~/lib/ingest");
-    const result = await ingestEmail({
-      source: "api",
-      from: text(input.from),
-      subject: text(input.subject),
-      text: text(input.text),
-      receivedAt: text(input.receivedAt) || undefined,
-    });
+    const result = await ingestEmail(
+      {
+        source: "api",
+        from: text(input.from),
+        subject: text(input.subject),
+        text: text(input.text),
+        receivedAt: text(input.receivedAt) || undefined,
+      },
+      options.exec,
+    );
 
-    if (!result.ok) return jsonResponse({ ok: false, error: "not_a_message", message: result.message }, 400);
+    if (!result.ok) {
+      // Two refusals that are not the same thing, answered differently on
+      // purpose: a payload that isn't a message is the caller's problem (400);
+      // a store that refused or fell back is ours (503), and the honest answer
+      // is the non-2xx a provider will retry. Neither stored anything, so
+      // neither reports stored — and neither may be treated as ingested.
+      const response =
+        result.reason === "store_failed"
+          ? jsonResponse(
+              { ok: false, error: "store_failed", stored: false, message: result.message },
+              503,
+            )
+          : jsonResponse({ ok: false, error: "not_a_message", message: result.message }, 400);
+      return { response, ingested: false, storedIn: null, storageState: result.storage.state };
+    }
 
     const { email, storage } = result;
     // `confirmed` is the only state that follows a query which really came back, so it
@@ -128,18 +178,36 @@ export async function ingestToResponse(
     // it can never slow this response down, and every failure of it is contained.
     queueAlert(email, options.notify);
 
-    return jsonResponse(body, options.status ?? 201);
+    return {
+      response: jsonResponse(body, options.status ?? 201),
+      ingested: true,
+      storedIn: result.storedIn,
+      storageState: storage.state,
+    };
   } catch (err) {
     console.error(failureLogLine(INGEST_FAILED_MESSAGE, err, "ingest"));
-    return jsonResponse(
-      {
-        ok: false,
-        error: "ingest_failed",
-        message: INGEST_FAILED_MESSAGE,
-      },
-      503,
-    );
+    return {
+      response: jsonResponse(
+        {
+          ok: false,
+          error: "ingest_failed",
+          message: INGEST_FAILED_MESSAGE,
+        },
+        503,
+      ),
+      ingested: false,
+      storedIn: null,
+      storageState: null,
+    };
   }
+}
+
+/** The response-only view of `ingestToOutcome` — what the plain JSON route needs. */
+export async function ingestToResponse(
+  input: InboundFields,
+  options: IngestOptions = {},
+): Promise<Response> {
+  return (await ingestToOutcome(input, options)).response;
 }
 
 /** `POST /api/inbound-email` — the plain JSON seam, guarded by the shared token. */

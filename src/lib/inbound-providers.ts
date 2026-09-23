@@ -36,6 +36,7 @@ import {
   jsonResponse,
   type GuardFailure,
 } from "~/lib/inbound-guard";
+import type { IngestOptions } from "~/lib/inbound-request";
 import { failureLogLine } from "~/lib/log-line";
 
 export const RESEND_WEBHOOK_SECRET_ENV = "RESEND_WEBHOOK_SECRET";
@@ -202,6 +203,11 @@ function rememberIngested(id: string): void {
   const map = seen();
   if (map.size > 2000) map.clear();
   map.set(id, Date.now());
+}
+
+/** Test helper: forget every remembered provider message id (cf. resetRateLimits). */
+export function resetIngestedProviderMessages(): void {
+  seen().clear();
 }
 
 /* ------------------------------------------------------------------ *
@@ -409,8 +415,41 @@ const UNKNOWN_PROVIDER: GuardFailure = {
 const WEBHOOK_FAILED_MESSAGE =
   "We couldn't process that webhook just now. Nothing was stored — the provider will send it again.";
 
-/** `POST /api/inbound-email/<provider>` — a provider webhook. Never 500s on bad input. */
-export async function handleProviderWebhookPost(name: string, request: Request): Promise<Response> {
+/**
+ * The words the provider gets when the funnel ran but the message could not be
+ * kept — the store refused, or it silently fell back to memory while a database
+ * was configured. Non-2xx on purpose: Resend retries non-2xx answers, and the
+ * whole point is that the next attempt must be free to store the message for
+ * real instead of being told it is already here.
+ */
+const PROVIDER_STORE_FAILED_MESSAGE =
+  "We read the message but couldn't save it just now, so nothing was kept — the provider will send it again.";
+
+/**
+ * `POST /api/inbound-email/<provider>` — a provider webhook. Never 500s on bad input.
+ *
+ * Duplicate suppression remembers an id **only after** the message is genuinely
+ * kept — never before, and never on a maybe:
+ *
+ *   - `storedIn: "database"` — a real insert came back. Durable; remember it.
+ *   - `storageState: "preview"` — no database is configured, memory IS the store,
+ *     and the map lives exactly as long as that store does; the existing good
+ *     case (an accidental repeat answered `duplicate`, stored once) is preserved.
+ *   - anything else — the store refused the write, or the message fell back to
+ *     memory while a database was configured: nothing is remembered, and a 2xx
+ *     from the funnel is replaced with an honest 503 so the provider retries.
+ *
+ * The order is the fix: the id used to be remembered *before* the ingest ran, so
+ * any store failure marked the mail ingested that was never stored — the retry
+ * was answered `duplicate` with a 200 and the owner's message was gone for good.
+ * When in doubt we do not suppress: one extra copy can be deleted, lost mail
+ * cannot be recovered.
+ */
+export async function handleProviderWebhookPost(
+  name: string,
+  request: Request,
+  options: IngestOptions = {},
+): Promise<Response> {
   const provider = PROVIDERS[name];
   if (!provider) return failureResponse(UNKNOWN_PROVIDER);
 
@@ -459,10 +498,32 @@ export async function handleProviderWebhookPost(name: string, request: Request):
         200,
       );
     }
-    if (providerMessageId) rememberIngested(providerMessageId);
 
-    const { ingestToResponse } = await import("~/lib/inbound-request");
-    return ingestToResponse({ ...read.message, provider: name });
+    const { ingestToOutcome } = await import("~/lib/inbound-request");
+    const outcome = await ingestToOutcome({ ...read.message, provider: name }, options);
+
+    // Remember only what is genuinely kept — AFTER the store, never before (see
+    // the doc comment above for the full rule and why the order is the fix).
+    const kept =
+      outcome.ingested && (outcome.storedIn === "database" || outcome.storageState === "preview");
+    if (kept && providerMessageId) rememberIngested(providerMessageId);
+
+    if (!kept && outcome.response.status < 400) {
+      // The funnel answered 2xx but the message is not genuinely kept (a memory
+      // fallback while a database is configured). Say so honestly, non-2xx, so
+      // the provider retries into a store that can actually keep the message.
+      return jsonResponse(
+        {
+          ok: false,
+          provider: name,
+          error: "store_failed",
+          stored: false,
+          message: PROVIDER_STORE_FAILED_MESSAGE,
+        },
+        503,
+      );
+    }
+    return outcome.response;
   } catch (err) {
     console.error(failureLogLine(WEBHOOK_FAILED_MESSAGE, err, "provider webhook"));
     return jsonResponse(

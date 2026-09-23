@@ -49,7 +49,20 @@ export type QueryExecutor = (
 ) => Promise<Row[]>;
 
 export type StoreResult<T> =
-  | { ok: true; value: T; storage: StorageStatus }
+  | {
+      ok: true;
+      value: T;
+      storage: StorageStatus;
+      /**
+       * Where the row actually landed — set by the write paths that feed the
+       * inbound funnel. "memory" can be honest preview (no database configured)
+       * or a silent fallback after the real store refused; callers that decide
+       * anything from durability (the provider webhook's duplicate suppression)
+       * must look at this, not at `storage` alone, which cannot tell the two
+       * memory cases apart.
+       */
+      storedIn?: "database" | "memory";
+    }
   | { ok: false; message: string; storage: StorageStatus };
 
 export const PREVIEW_NOTE =
@@ -417,7 +430,7 @@ export async function insertEmail(
       aiProvider: row.aiProvider,
       dates: parseDates(row.datesJson),
     });
-    return ok({ id });
+    return { ...ok({ id }), storedIn: "memory" as const };
   }
 
   try {
@@ -435,7 +448,7 @@ export async function insertEmail(
       returning id
     `;
     if (inserted.length === 0) return fail(FAILED_WRITE);
-    return ok({ id: str(inserted[0].id) });
+    return { ...ok({ id: str(inserted[0].id) }), storedIn: "database" as const };
   } catch (err) {
     console.error("[inbox] insertEmail failed:", failedQueryLine("write", err));
     return fail(FAILED_WRITE);

@@ -43,6 +43,15 @@
  *      query succeeds. Rendered too, on the real card, so the wording on screen is
  *      asserted and not just the view model. Hermetic: a stubbed executor, no live
  *      database, no network.
+ *  15. duplicate suppression on the provider webhook remembers a provider message
+ *      id only once the message genuinely reached a store: a refused store answers
+ *      503 store_failed — the kind Resend retries — and remembers nothing, so the
+ *      retry stores the message instead of being told it is a duplicate; a silent
+ *      memory fallback while a database is configured is refused the same way; a
+ *      real store followed by an accidental repeat is still answered `duplicate`
+ *      with exactly one insert; and an ignored event stores and remembers nothing.
+ *      Hermetic: a stand-in provider and injected executors, no network, no real
+ *      database.
  */
 import { heuristicDates, heuristicDraft, heuristicImportance, aiStatus } from "../src/lib/ai";
 import { fromStructured, parseRawEmail } from "../src/lib/email-parse";
@@ -65,10 +74,12 @@ import {
 } from "../src/lib/inbound-guard";
 import { handleInboundEmailGet, handleInboundEmailPost } from "../src/lib/inbound-request";
 import {
+  PROVIDERS,
   RESEND_API_KEY_ENV,
   RESEND_WEBHOOK_SECRET_ENV,
   handleProviderWebhookGet,
   handleProviderWebhookPost,
+  resetIngestedProviderMessages,
   signatureHeaders,
   verifyResendSignature,
 } from "../src/lib/inbound-providers";
@@ -1059,6 +1070,203 @@ async function main() {
   delete process.env.DATABASE_URL;
   resetStorageEvidence();
   check("no address → preview again, so nothing leaks out of this section", storageStatus().state === "preview");
+
+  /* ---------------------------------------------------------------- *
+   * 15. Duplicate suppression remembers only what was really stored
+   * ---------------------------------------------------------------- */
+
+  console.log("\n15. Duplicate suppression remembers only what was really stored");
+
+  // A stand-in provider: the route logic under test is provider-agnostic, and
+  // this one needs no network — read() answers with the message a real provider
+  // would have handed over, tagged with whichever id the scenario names.
+  PROVIDERS["selftest"] = {
+    name: "selftest",
+    label: "Self-test provider",
+    envVars: [],
+    configureHint: "(self-test only)",
+    connection: () => ({ connected: true }),
+    read: async (_request, rawBody) => {
+      const event = JSON.parse(rawBody) as { kind?: string; providerMessageId?: string };
+      if (event.kind === "ignored") {
+        return { ok: true, kind: "ignored", reason: "Ignored on purpose — the self-test said so." };
+      }
+      return {
+        ok: true,
+        kind: "message",
+        message: {
+          from: "Marcus Bell <marcus@example.com>",
+          subject: urgentEmail.subject,
+          text: urgentEmail.body,
+          receivedAt: WEDNESDAY,
+          providerMessageId: event.providerMessageId ?? null,
+        },
+      };
+    },
+  };
+
+  const SELFTEST_URL = "http://localhost/api/inbound-email/selftest";
+  const providerPost = (body: Record<string, unknown>) =>
+    postRequest(SELFTEST_URL, JSON.stringify(body));
+  const insertsIn = (calls: Call[]) => calls.filter((c) => /insert into emails/i.test(c.sql)).length;
+  const storePlan = (sqlText: string) => {
+    if (/^create table/i.test(sqlText)) return [];
+    if (/insert into emails/i.test(sqlText)) return [{ id: 4101 }];
+    if (/select id from drafts/i.test(sqlText)) return [];
+    return [{ id: 1 }];
+  };
+
+  // A fresh-process story: DATABASE_URL is set (so a store that really comes back
+  // reads as `confirmed`, exactly as in production) and the store starts working.
+  // `broken` is the same store refusing every insert — the delivery-time failure.
+  process.env.DATABASE_URL = "postgresql://u:p@db.internal.example:5432/doppel";
+  resetStorageEvidence();
+  resetIngestedProviderMessages();
+  resetRateLimits();
+
+  const PID = "provider-msg-order-1";
+  const refusedStore = fakeDb(storePlan, { throwOn: "insert" });
+  const working = fakeDb(storePlan);
+
+  console.log("\n15a. The store refuses the first delivery — not a duplicate, not stored, retryable");
+  const refusedDelivery = await handleProviderWebhookPost(
+    "selftest",
+    providerPost({ providerMessageId: PID }),
+    { exec: refusedStore.exec },
+  );
+  const refusedBody = await jsonOf(refusedDelivery);
+  check("the funnel really ran (one insert attempt reached the store)", insertsIn(refusedStore.calls) === 1, insertsIn(refusedStore.calls));
+  check("a refused store is NOT answered as a duplicate", refusedBody.duplicate !== true && refusedBody.ok === false, refusedBody);
+  check("the answer is 503 — non-2xx, the kind Resend retries", refusedDelivery.status === 503, refusedDelivery.status);
+  check("typed as store_failed", refusedBody.error === "store_failed", refusedBody.error);
+  check(
+    "it does not claim the message was stored",
+    refusedBody.stored === false &&
+      /nothing was (kept|recorded)|so nothing was/i.test(String(refusedBody.message)),
+    refusedBody.message,
+  );
+
+  console.log("\n15b. The same id arrives again with the store recovered — accepted and stored");
+  resetStorageEvidence(); // a fresh process after the incident: no failure on record
+  const recovered = await handleProviderWebhookPost(
+    "selftest",
+    providerPost({ providerMessageId: PID }),
+    { exec: working.exec },
+  );
+  const recoveredBody = await jsonOf(recovered);
+  check(
+    "the retry is accepted (201, ok) and NOT told it is a duplicate",
+    recovered.status === 201 && recoveredBody.ok === true && recoveredBody.duplicate !== true,
+    { status: recovered.status, body: recoveredBody },
+  );
+  check("the mail really reached the store this time", insertsIn(working.calls) === 1, insertsIn(working.calls));
+  check(
+    "...and the answer claims a real store",
+    recoveredBody.stored === true && recoveredBody.storage === "database",
+    { stored: recoveredBody.stored, storage: recoveredBody.storage },
+  );
+
+  console.log("\n15c. A successful store followed by an accidental repeat — still a duplicate, stored once");
+  const repeat = await handleProviderWebhookPost(
+    "selftest",
+    providerPost({ providerMessageId: PID }),
+    { exec: working.exec },
+  );
+  const repeatBody = await jsonOf(repeat);
+  check(
+    "the repeat is answered duplicate with a 200",
+    repeat.status === 200 && repeatBody.duplicate === true && repeatBody.ok === true,
+    { status: repeat.status, body: repeatBody },
+  );
+  check("...and the store still holds exactly one insert for the pair", insertsIn(working.calls) === 1, insertsIn(working.calls));
+
+  console.log("\n15d. Even with the status stuck on failed, a real store is remembered (not lost, not duplicated)");
+  // The failure verdict is sticky for the process, so a delivery that succeeds
+  // while the line says "failing" must still be remembered — `storedIn` (where
+  // the row landed) decides, not the status state alone.
+  resetStorageEvidence();
+  const broken2 = fakeDb(storePlan, { throwOn: "insert" });
+  const working2 = fakeDb(storePlan);
+  const PID2 = "provider-msg-order-2";
+  const refused2 = await handleProviderWebhookPost("selftest", providerPost({ providerMessageId: PID2 }), { exec: broken2.exec });
+  check("the store refuses once more (non-2xx, nothing remembered)", refused2.status === 503 && (await jsonOf(refused2)).duplicate !== true, refused2.status);
+  const sticky = await handleProviderWebhookPost("selftest", providerPost({ providerMessageId: PID2 }), { exec: working2.exec });
+  const stickyBody = await jsonOf(sticky);
+  check(
+    "with the failure still on record, the next delivery is accepted and remembered",
+    sticky.status === 201 && stickyBody.duplicate !== true && insertsIn(working2.calls) === 1,
+    { status: sticky.status, inserts: insertsIn(working2.calls) },
+  );
+  const stickyRepeat = await handleProviderWebhookPost("selftest", providerPost({ providerMessageId: PID2 }), { exec: working2.exec });
+  check(
+    "its repeat is a duplicate despite the failed status line",
+    stickyRepeat.status === 200 && (await jsonOf(stickyRepeat)).duplicate === true && insertsIn(working2.calls) === 1,
+    stickyRepeat.status,
+  );
+
+  console.log("\n15e. An ignored event stores nothing and remembers nothing");
+  resetRateLimits();
+  const PID3 = "provider-msg-order-3";
+  const ignoredEvent = await handleProviderWebhookPost(
+    "selftest",
+    providerPost({ kind: "ignored", providerMessageId: PID3 }),
+    { exec: working2.exec },
+  );
+  const ignoredEventBody = await jsonOf(ignoredEvent);
+  check(
+    "an ignored event is accepted with a 200 and flagged ignored",
+    ignoredEvent.status === 200 && ignoredEventBody.ok === true && ignoredEventBody.ignored === true,
+    { status: ignoredEvent.status, body: ignoredEventBody },
+  );
+  check("nothing was stored for it", insertsIn(working2.calls) === 1, insertsIn(working2.calls));
+  const afterIgnored = await handleProviderWebhookPost("selftest", providerPost({ providerMessageId: PID3 }), { exec: working2.exec });
+  check(
+    "the id it carried is NOT remembered: a real delivery of it is accepted, not a duplicate",
+    afterIgnored.status === 201 && (await jsonOf(afterIgnored)).duplicate !== true,
+    afterIgnored.status,
+  );
+
+  console.log("\n15f. A silent memory fallback while a database is configured is refused, not swallowed");
+  // The seam the bug hid in: the funnel can answer 2xx while the row only landed
+  // in memory (the store fell back after its client failed to build). That 2xx
+  // must become an honest 503, and the id must not be remembered.
+  process.env.DATABASE_URL = "not a connection string";
+  resetStorageEvidence();
+  resetRateLimits();
+  const PID4 = "provider-msg-order-4";
+  const fellBack = await handleProviderWebhookPost("selftest", providerPost({ providerMessageId: PID4 }));
+  const fellBackBody = await jsonOf(fellBack);
+  check(
+    "the fallback answers 503 store_failed, never a quiet 2xx",
+    fellBack.status === 503 && fellBackBody.error === "store_failed" && fellBackBody.stored === false,
+    { status: fellBack.status, body: fellBackBody },
+  );
+  check("it is not answered as a duplicate", fellBackBody.duplicate !== true, fellBackBody);
+
+  console.log("\n15g. The retry lands in honest preview — accepted once, then a duplicate");
+  delete process.env.DATABASE_URL; // no database at all: memory IS the store now
+  const previewDelivery = await handleProviderWebhookPost("selftest", providerPost({ providerMessageId: PID4 }));
+  const previewBody = await jsonOf(previewDelivery);
+  check(
+    "the same id is accepted (the mail was not lost by the refused attempt)",
+    previewDelivery.status === 201 && previewBody.ok === true && previewBody.duplicate !== true,
+    { status: previewDelivery.status, body: previewBody },
+  );
+  check("...answered honestly as not persisted", previewBody.stored === false && /not persisted/i.test(String(previewBody.note)), previewBody.note);
+  const previewRepeat = await handleProviderWebhookPost("selftest", providerPost({ providerMessageId: PID4 }));
+  check(
+    "its repeat is a duplicate — the preview good case is preserved",
+    previewRepeat.status === 200 && (await jsonOf(previewRepeat)).duplicate === true,
+    previewRepeat.status,
+  );
+
+  // Leave no trace: the stand-in provider, the remembered ids, the rate-limit
+  // bucket, the storage evidence and the connection string.
+  delete PROVIDERS["selftest"];
+  resetIngestedProviderMessages();
+  resetRateLimits();
+  resetStorageEvidence();
+  delete process.env.DATABASE_URL;
 
   console.log(failures === 0 ? "\nAll inbox checks passed.\n" : `\n${failures} check(s) FAILED.\n`);
   process.exit(failures === 0 ? 0 : 1);

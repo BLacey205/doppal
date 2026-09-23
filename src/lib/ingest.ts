@@ -35,8 +35,32 @@ export type IngestInput = {
 };
 
 export type IngestResult =
-  | { ok: true; email: StoredEmail; storage: StorageStatus; ai: AiStatus }
-  | { ok: false; message: string; storage: StorageStatus };
+  | {
+      ok: true;
+      email: StoredEmail;
+      storage: StorageStatus;
+      ai: AiStatus;
+      /**
+       * Where the row actually landed — "database" only when a real insert came
+       * back. Callers that must never claim or remember more than happened (the
+       * provider webhook's duplicate suppression) read this, not `storage` alone:
+       * a memory fallback while a database is configured reports a database-y
+       * status but landed in memory all the same.
+       */
+      storedIn: "database" | "memory";
+    }
+  | {
+      ok: false;
+      /**
+       * Why the funnel refused: "not_a_message" is the caller's payload (a 400
+       * problem); "store_failed" is our store refusing or falling back (a 503
+       * problem, retryable). The two used to share one answer, which let a
+       * refused store be reported as if the payload were at fault.
+       */
+      reason: "not_a_message" | "store_failed";
+      message: string;
+      storage: StorageStatus;
+    };
 
 const EMPTY_MESSAGE =
   "That doesn't look like a message yet — paste the text of the email (the From and Subject lines help too) and try again.";
@@ -58,7 +82,7 @@ export async function ingestEmail(
       });
 
   if (!parsed.body.trim() && (!parsed.subject || parsed.subject === "(no subject)")) {
-    return { ok: false, message: EMPTY_MESSAGE, storage: status };
+    return { ok: false, reason: "not_a_message", message: EMPTY_MESSAGE, storage: status };
   }
 
   const forAi: EmailForAi = {
@@ -104,7 +128,9 @@ export async function ingestEmail(
     exec,
   );
 
-  if (!inserted.ok) return { ok: false, message: inserted.message, storage: inserted.storage };
+  if (!inserted.ok) {
+    return { ok: false, reason: "store_failed", message: inserted.message, storage: inserted.storage };
+  }
 
   const savedDraft = await saveDraft(
     {
@@ -137,7 +163,15 @@ export async function ingestEmail(
     draft: savedDraft.ok ? savedDraft.value : null,
   };
 
-  return { ok: true, email, storage: inserted.storage, ai };
+  return {
+    ok: true,
+    email,
+    storage: inserted.storage,
+    ai,
+    // A store that ever forgets to say where it landed is treated as memory —
+    // the mail-safe direction: never suppress a retry that might be needed.
+    storedIn: inserted.storedIn ?? "memory",
+  };
 }
 
 /**
