@@ -30,6 +30,7 @@
  */
 
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { noteProviderFailure, noteProviderMailStored } from "~/lib/channel-evidence";
 import {
   failureResponse,
   intakePreflight,
@@ -419,6 +420,22 @@ export const PROVIDERS: Record<string, InboundProvider> = {
   [resendProvider.name]: resendProvider,
 };
 
+/**
+ * The one sentence a provider's route answers with — composed here, once, so the
+ * `GET /api/inbound-email/<provider>` handler and the /app Connections card (which
+ * shows the same string verbatim) can never drift apart. The Connections card
+ * builds its email-channel message with this same function over the same provider.
+ */
+export function providerRouteMessage(
+  provider: InboundProvider,
+  connected: boolean,
+  notConnectedMessage = "",
+): string {
+  return `${provider.label} posts here. ${
+    connected ? "This route is armed and ready." : notConnectedMessage
+  } Nothing is ever sent from Doppel.`;
+}
+
 /* ------------------------------------------------------------------ *
  * The route logic (testable without a server)
  * ------------------------------------------------------------------ */
@@ -499,6 +516,11 @@ export async function handleProviderWebhookPost(
     const read = await provider.read(request, preflight.rawBody);
 
     if (!read.ok) {
+      // The provider refused our credentials — the key is set but wrong. That is a
+      // real channel failure, recorded so the Connections card says so instead of
+      // leaving "configured" standing. Transient read failures (a network blip,
+      // a bad payload) are not recorded: the provider's retry schedule owns those.
+      if (read.code === "provider_rejected_key") noteProviderFailure(name, read.code, read.message);
       return jsonResponse(
         { ok: false, provider: name, connected: true, error: read.code, message: read.message },
         read.status,
@@ -530,6 +552,12 @@ export async function handleProviderWebhookPost(
     const kept =
       outcome.ingested && (outcome.storedIn === "database" || outcome.storageState === "preview");
     if (kept && providerMessageId) rememberIngested(providerMessageId);
+    // The Connections card's only path to `proven`: a real forwarded message that
+    // reached a store that kept it. Recorded at the same moment as the duplicate
+    // memory, from the same facts — the store's own word about where the row landed.
+    if (kept) {
+      noteProviderMailStored(name, outcome.storedIn === "database" ? "database" : "preview");
+    }
 
     if (!kept && outcome.response.status < 400) {
       // The funnel answered 2xx but the message is not genuinely kept (a memory
@@ -573,9 +601,13 @@ export function handleProviderWebhookGet(name: string): Response {
       provider: name,
       connected: connection.connected,
       error: "method_not_allowed",
-      message: `${provider.label} posts here. ${
-        connection.connected ? "This route is armed and ready." : connection.message
-      } Nothing is ever sent from Doppel.`,
+      // Composed by `providerRouteMessage` — the same function the /app Connections
+      // card reads, so the route's answer and the card cannot drift.
+      message: providerRouteMessage(
+        provider,
+        connection.connected,
+        connection.connected ? "" : connection.message,
+      ),
     },
     405,
   );

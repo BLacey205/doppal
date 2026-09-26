@@ -71,6 +71,18 @@
  *      Fixtures are copied from Resend's published examples (doc URLs in the
  *      section comments); hermetic: the upstream fetch is a stub, the store is
  *      the stand-in, no network.
+ *  18. the /app Connections card tells the truth about each channel. Not
+ *      configured → the state names the missing env vars BY NAME and the card's
+ *      message is the very string `GET /api/inbound-email/resend` answers with
+ *      (one source of truth, no drift); configured → "configured, not proven",
+ *      still not claiming a connection, and no secret VALUE appears anywhere in
+ *      the view model or the rendered HTML; a passing check records verbatim
+ *      facts (the typed 405, the refused unsigned probe) and never moves the
+ *      channel out of its state; a failed check says so and is not cleared by a
+ *      passing one; a real forwarded message fetched and stored through the
+ *      provider (hermetic: stubbed upstream, memory store) is the only thing
+ *      that turns the state to "Connected", with when and where; and the
+ *      owner's steps render in the declared order with the standing line.
  */
 import { heuristicDates, heuristicDraft, heuristicImportance, aiStatus } from "../src/lib/ai";
 import { fromStructured, parseRawEmail } from "../src/lib/email-parse";
@@ -129,6 +141,10 @@ import {
 import { alertsView } from "../src/lib/alert-view";
 import { databaseHostSafe, databaseTransport, sql as databaseClient } from "../src/db";
 import { AlertsLine, ModeCard } from "../src/components/app-ui";
+import { ConnectionsSection } from "../src/components/channel-ui";
+import { noteChannelCheck, resetChannelEvidence } from "../src/lib/channel-evidence";
+import { channelStatuses, runChannelChecks } from "../src/lib/channels";
+import { channelView } from "../src/lib/channel-view";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { AlertState, AlertStatus, StorageStatus } from "../src/lib/inbox-types";
@@ -1680,13 +1696,349 @@ async function main() {
     cRowOk?.body,
   );
 
+  /* ---------------------------------------------------------------- *
+   * 18. The Connections card: honest states, steps in order, a check
+   *     that claims only what it proved
+   * ---------------------------------------------------------------- */
+
+  console.log("\n18. The /app Connections card: honest states, the owner's steps, a check that proves only what it ran");
+
+  // Start from nothing: no secrets, no channel evidence, no rate-limit bucket,
+  // no storage evidence from earlier sections.
+  delete process.env[RESEND_WEBHOOK_SECRET_ENV];
+  delete process.env[RESEND_API_KEY_ENV];
+  delete process.env.DATABASE_URL;
+  delete process.env[KNOCK_API_KEY_ENV];
+  resetChannelEvidence();
+  resetRateLimits();
+  resetIngestedProviderMessages();
+  resetStorageEvidence();
+
+  const emailStatus = () => channelStatuses().find((channel) => channel.id === "email")!;
+  const renderConnections = () =>
+    renderToStaticMarkup(
+      React.createElement(ConnectionsSection, { channels: channelStatuses().map(channelView) }),
+    );
+
+  // 18a. Not configured: honest, and the missing env vars are named BY NAME.
+  console.log("\n18a. Not configured — names the missing env vars, says nothing is flowing");
+  let email = emailStatus();
+  check("18a the email channel reports not_configured", email.state === "not_configured", email.state);
+  check(
+    "18a it names both missing env vars, by name, in order",
+    email.missingEnvVars[0] === RESEND_WEBHOOK_SECRET_ENV && email.missingEnvVars[1] === RESEND_API_KEY_ENV,
+    email.missingEnvVars,
+  );
+  const routeGet = handleProviderWebhookGet("resend");
+  const routeBody = await jsonOf(routeGet);
+  check(
+    "18a the card's message is the very string GET /api/inbound-email/resend answers with",
+    routeGet.status === 405 && routeBody.connected === false && email.message === routeBody.message,
+    { card: email.message, route: routeBody.message },
+  );
+  check(
+    "18a the honesty line says plainly that no mail is flowing",
+    (email.honesty ?? "").includes("No mail is flowing into Doppel"),
+    email.honesty,
+  );
+  const htmlA = renderConnections();
+  check(
+    "18a the rendered card shows the Not connected chip and both env-var names",
+    htmlA.includes("Not connected") && htmlA.includes("RESEND_WEBHOOK_SECRET") && htmlA.includes("RESEND_API_KEY"),
+    "chip or a missing var name not found",
+  );
+  check(
+    "18a the rendered card does not claim a connection",
+    !htmlA.includes(">Connected<") && htmlA.includes("Nothing is claimed connected until a real forwarded message"),
+    "chip or standing line missing",
+  );
+
+  // The owner's steps, in the declared order, with the webhook URL.
+  const stepMarkers = [
+    "Create a Resend account",
+    "Receiving address",
+    "Full access",
+    "Add Webhook",
+    "Save the two secrets",
+    "forwarding rule",
+  ];
+  const stepPositions = stepMarkers.map((marker) => htmlA.indexOf(marker));
+  check(
+    "18a the owner's six steps render, in the declared order",
+    stepPositions.every((position) => position >= 0) &&
+      stepPositions.every((position, index) => index === 0 || position > stepPositions[index - 1]!),
+    stepPositions,
+  );
+  check(
+    "18a the steps carry the real webhook URL, exactly once",
+    (htmlA.match(/https:\/\/doppal\.ctonew\.app\/api\/inbound-email\/resend/g) ?? []).length === 1,
+    "webhook URL count wrong",
+  );
+  check("18a the Check now action is offered", htmlA.includes("Check now"), "button missing");
+
+  // 18b. Configured but unproven — and no secret VALUE anywhere.
+  console.log("\n18b. Configured: still not claimed as connected, and no secret value appears anywhere");
+  const FAKE_WEBHOOK_SECRET = "whsec_selftest_not_a_real_signing_secret_value";
+  const FAKE_API_KEY = "re_selftest_not_a_real_api_key_value";
+  process.env[RESEND_WEBHOOK_SECRET_ENV] = FAKE_WEBHOOK_SECRET;
+  process.env[RESEND_API_KEY_ENV] = FAKE_API_KEY;
+  email = emailStatus();
+  check(
+    "18b the state is configured_unproven, with no missing vars",
+    email.state === "configured_unproven" && email.missingEnvVars.length === 0,
+    email.state,
+  );
+  check(
+    "18b the honesty line says the connection is not claimed",
+    (email.honesty ?? "").includes("not claimed as connected"),
+    email.honesty,
+  );
+  const viewsB = channelStatuses().map(channelView);
+  check(
+    "18b the chip says configured, not proven — never Connected",
+    viewsB[0]!.chip === "Configured, not proven" && viewsB[0]!.tone === "amber",
+    { chip: viewsB[0]!.chip, tone: viewsB[0]!.tone },
+  );
+  const statusJson = JSON.stringify(channelStatuses()) + JSON.stringify(viewsB);
+  check(
+    "18b neither fake secret VALUE appears in any view model",
+    !statusJson.includes(FAKE_WEBHOOK_SECRET) && !statusJson.includes(FAKE_API_KEY),
+    "a value leaked into the view model",
+  );
+  const htmlB = renderToStaticMarkup(React.createElement(ConnectionsSection, { channels: viewsB }));
+  check(
+    "18b neither fake secret VALUE appears anywhere in the rendered card",
+    !htmlB.includes(FAKE_WEBHOOK_SECRET) && !htmlB.includes(FAKE_API_KEY),
+    "a value leaked into the HTML",
+  );
+
+  // 18c. The check: verbatim facts, and it never moves the channel's state.
+  console.log("\n18c. Check now: the route's own answer and the unsigned refusal, verbatim — and no state change");
+  const checked = await runChannelChecks();
+  email = checked.find((channel) => channel.id === "email")!;
+  check(
+    "18c the check ran and recorded an outcome",
+    email.lastCheck !== null && email.lastCheck.kind === "ok",
+    email.lastCheck?.kind,
+  );
+  const okCheck = email.lastCheck && email.lastCheck.kind === "ok" ? email.lastCheck : null;
+  check("18c the check carried exactly two facts", okCheck !== null && okCheck.facts.length === 2, okCheck?.facts.length);
+  const factRoute = okCheck?.facts[0];
+  const factProbe = okCheck?.facts[1];
+  check(
+    "18c fact 1 is the route's typed 405, expected, connected:true",
+    factRoute !== undefined &&
+      factRoute.status === 405 &&
+      factRoute.expected === true &&
+      factRoute.body.connected === true &&
+      factRoute.body.error === "method_not_allowed",
+    factRoute,
+  );
+  check(
+    "18c fact 2 is the unsigned probe, refused 401 missing_signature, expected",
+    factProbe !== undefined && factProbe.status === 401 && factProbe.expected === true && factProbe.body.error === "missing_signature",
+    factProbe,
+  );
+  check(
+    "18c the summary claims the route's honesty, not a connection",
+    (okCheck?.summary ?? "").includes("mail is not proven flowing until a real forwarded message is fetched and stored"),
+    okCheck?.summary,
+  );
+  check(
+    "18c a passing check did NOT move the channel out of configured_unproven",
+    email.state === "configured_unproven" && (email.honesty ?? "").length > 0,
+    { state: email.state, honesty: email.honesty },
+  );
+
+  // 18d. A failed check says so, and a passing one does not clear it.
+  console.log("\n18d. A failed check: said plainly, sticky until a real event supersedes it");
+  resetChannelEvidence();
+  const failedReason =
+    "An unsigned webhook was accepted — that must never happen: forged mail could be stored. This channel is reported as failed.";
+  noteChannelCheck("email", {
+    kind: "failed",
+    ranAt: new Date().toISOString(),
+    ranAtLabel: "2026-09-24 at 12:00 UTC",
+    facts: [],
+    reason: failedReason,
+  });
+  email = emailStatus();
+  check("18d the channel reports failed", email.state === "failed", email.state);
+  check(
+    "18d the failure carries the check's reason as its message",
+    email.failure?.code === "check_failed" && email.failure?.message === failedReason,
+    email.failure,
+  );
+  check(
+    "18d the honesty line says the channel stays failed until real mail is stored",
+    (email.honesty ?? "").includes("reported as failed"),
+    email.honesty,
+  );
+  const checkedAgain = await runChannelChecks();
+  const emailAfterPass = checkedAgain.find((channel) => channel.id === "email")!;
+  check(
+    "18d a later PASSING check does not clear the failure",
+    emailAfterPass.state === "failed" && emailAfterPass.lastCheck?.kind === "ok",
+    { state: emailAfterPass.state, lastCheck: emailAfterPass.lastCheck?.kind },
+  );
+  const htmlD = renderConnections();
+  check(
+    "18d the rendered card shows the Failed chip and the reason",
+    htmlD.includes("Failed") && htmlD.includes("unsigned webhook was accepted"),
+    "render missing failure",
+  );
+
+  // 18e. The only path to Connected: a real forwarded message fetched and stored
+  // (hermetic — the upstream fetch is a stub, the store is the honest preview).
+  console.log("\n18e. A real forwarded message, fetched and stored, is the only thing that says Connected");
+  process.env[RESEND_WEBHOOK_SECRET_ENV] = SECRET; // the signature the provider would send
+  process.env[RESEND_API_KEY_ENV] = FAKE_API_KEY; // never leaves the process: the upstream is stubbed
+  resetIngestedProviderMessages();
+  resetRateLimits();
+  const deliverThroughProvider = async (
+    messageId: string,
+    upstream: () => Response,
+  ): Promise<{ response: Response; body: Record<string, any> }> => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => upstream()) as typeof fetch;
+    try {
+      const eventBody = JSON.stringify({
+        type: "email.received",
+        created_at: WEDNESDAY,
+        data: { email_id: messageId, created_at: WEDNESDAY, ...DOCS_EVENT_DATA },
+      });
+      const ts = String(Math.floor(Date.now() / 1000));
+      const response = await handleProviderWebhookPost(
+        "resend",
+        postRequest(RESEND_URL, eventBody, {
+          "svix-id": messageId,
+          "svix-timestamp": ts,
+          "svix-signature": svixSignature(messageId, ts, eventBody, SECRET),
+        }),
+        { notify: () => {} }, // the alert path is section 12's business; nothing is sent here
+      );
+      return { response, body: await jsonOf(response) };
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  };
+  const provenDelivery = await deliverThroughProvider(
+    "3d6f9a1c-0000-4000-8000-00000000e18e",
+    () =>
+      new Response(JSON.stringify(DOCS_RETRIEVE_EXAMPLE), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+  );
+  check(
+    "18e the delivery really was answered 201 and kept",
+    provenDelivery.response.status === 201 && provenDelivery.body.ok === true,
+    { status: provenDelivery.response.status },
+  );
+  email = emailStatus();
+  check("18e the channel is now proven", email.state === "proven", email.state);
+  check(
+    "18e a proven channel carries no honesty line — it may claim the connection",
+    email.honesty === null,
+    email.honesty,
+  );
+  check(
+    "18e the proof names where the row landed",
+    (email.provenWhere ?? "").includes("in-memory preview"),
+    email.provenWhere,
+  );
+  const viewsE = channelStatuses().map(channelView);
+  check(
+    "18e the chip is Connected, emerald",
+    viewsE[0]!.chip === "Connected" && viewsE[0]!.tone === "emerald",
+    { chip: viewsE[0]!.chip },
+  );
+  check(
+    "18e the proven line carries when it was proven",
+    (viewsE[0]!.provenLine ?? "").includes("Proven: a real forwarded message was fetched and stored at"),
+    viewsE[0]!.provenLine,
+  );
+  const htmlE = renderToStaticMarkup(React.createElement(ConnectionsSection, { channels: viewsE }));
+  check(
+    "18e the rendered card says Connected and shows the proof",
+    htmlE.includes("Connected") && htmlE.includes("Proven: a real forwarded message"),
+    "render missing proof",
+  );
+
+  // 18f. A provider that refuses our key fails the channel — said in its own words.
+  console.log("\n18f. The provider refusing our key fails the channel, in the app's own words");
+  resetRateLimits();
+  const rejectedDelivery = await deliverThroughProvider(
+    "3d6f9a1c-0000-4000-8000-00000000f00d",
+    () =>
+      new Response(JSON.stringify({ name: "unauthorized", message: "Missing scopes" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+  );
+  check(
+    "18f the refused read answers 503 provider_rejected_key",
+    rejectedDelivery.response.status === 503 && rejectedDelivery.body.error === "provider_rejected_key",
+    { status: rejectedDelivery.response.status, error: rejectedDelivery.body.error },
+  );
+  email = emailStatus();
+  check("18f the channel reports failed again — the later event wins", email.state === "failed", email.state);
+  check(
+    "18f the failure names what happened, in the app's words",
+    (email.failure?.message ?? "").includes("Resend didn't accept the API key we hold"),
+    email.failure?.message,
+  );
+  const htmlF = renderConnections();
+  check(
+    "18f the rendered card shows the failure, not a connection",
+    htmlF.includes("Failed") && !htmlF.includes(">Connected<"),
+    "render wrong",
+  );
+
+  // 18g. The shape takes a second channel with no page changes (SMS joins later
+  // by adding one adapter to the registry — this only proves the page renders it).
+  console.log("\n18g. A second channel plugs into the same page without reshaping it");
+  const smsStatus: typeof email = {
+    ...email,
+    id: "sms",
+    label: "Text messages (SMS)",
+    purpose: "A future channel: text messages in, triaged like mail.",
+    state: "not_configured" as const,
+    envVars: [{ name: "SMS_PROVIDER_TOKEN", role: "the SMS provider's token" }],
+    missingEnvVars: ["SMS_PROVIDER_TOKEN"],
+    message: "Text messages aren't connected yet: SMS_PROVIDER_TOKEN is not set.",
+    honesty: "No messages are flowing into Doppel: this channel is not connected.",
+    provenAt: null,
+    provenWhere: null,
+    failure: null,
+    lastCheck: null,
+    canCheck: false,
+    webhookUrl: null,
+    ownerSteps: ["Choose an SMS provider."],
+    standingLine: "Nothing is claimed connected until a real message has been fetched and stored.",
+  };
+  const twoChannels = renderToStaticMarkup(
+    React.createElement(ConnectionsSection, { channels: [channelView(emailStatus()), channelView(smsStatus)] }),
+  );
+  check(
+    "18g both cards render from the same component, each with its own state",
+    twoChannels.includes("forwarded mail via Resend") && twoChannels.includes("Text messages (SMS)"),
+    "second card missing",
+  );
+  check(
+    "18g the SMS card names its own missing var and offers no check it does not have",
+    twoChannels.includes("SMS_PROVIDER_TOKEN") && twoChannels.includes("No check exists for this channel yet"),
+    "sms card wrong",
+  );
+
   // Leave no trace: the secrets, the connection string, the remembered ids,
-  // the rate-limit bucket and the storage evidence.
+  // the rate-limit bucket, the channel evidence and the storage evidence.
   delete process.env[RESEND_WEBHOOK_SECRET_ENV];
   delete process.env[RESEND_API_KEY_ENV];
   delete process.env.DATABASE_URL;
   resetIngestedProviderMessages();
   resetRateLimits();
+  resetChannelEvidence();
   resetStorageEvidence();
 
   console.log(failures === 0 ? "\nAll inbox checks passed.\n" : `\n${failures} check(s) FAILED.\n`);

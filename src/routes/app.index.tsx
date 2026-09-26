@@ -2,6 +2,9 @@ import { Link, createFileRoute, useRouter } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 
 import { AlertsLine, AppNav, Chip, ModeCard, Notice, ScoreBadge } from "~/components/app-ui";
+import { ConnectionsSection } from "~/components/channel-ui";
+import { getChannels, runChannelsCheck } from "~/lib/channel-fns";
+import { channelView } from "~/lib/channel-view";
 import { getInbox, ingestPastedEmail, loadSampleInbox } from "~/lib/inbox";
 
 export const Route = createFileRoute("/app/")({
@@ -19,18 +22,38 @@ export const Route = createFileRoute("/app/")({
       },
     ],
   }),
-  loader: async () => await getInbox(),
+  loader: async () => ({ inbox: await getInbox(), channels: await getChannels() }),
   component: AppInbox,
 });
 
 type FeedNotice = { tone: "amber" | "emerald" | "rose"; message: string } | null;
 
 function AppInbox() {
-  const view = Route.useLoaderData();
+  const { inbox: view, channels: initialChannels } = Route.useLoaderData();
   const router = useRouter();
   const [raw, setRaw] = useState("");
   const [busy, setBusy] = useState<null | "paste" | "sample">(null);
   const [notice, setNotice] = useState<FeedNotice>(null);
+
+  // Connections: rendered from the server's evidence, refreshed only by a real
+  // check. Until then the card shows exactly what the server last knew.
+  const [channels, setChannels] = useState(() => initialChannels.channels.map(channelView));
+  const [checking, setChecking] = useState(false);
+  const [checkError, setCheckError] = useState<string | null>(null);
+
+  const runCheck = async () => {
+    setChecking(true);
+    setCheckError(null);
+    try {
+      const fresh = await runChannelsCheck();
+      setChannels(fresh.channels.map(channelView));
+    } catch {
+      setCheckError(
+        "The check could not run just now, so the card is unchanged — nothing is claimed either way.",
+      );
+    }
+    setChecking(false);
+  };
 
   const guard = async (work: () => Promise<{ ok: boolean; message: string }>) => {
     try {
@@ -130,6 +153,9 @@ function AppInbox() {
         {/* Whether the owner is actually told when important mail arrives. */}
         <AlertsLine alerts={view.alerts} />
       </div>
+
+      {/* How each channel really stands — starting with email (Resend forwarding). */}
+      <ConnectionsSection channels={channels} checking={checking} checkError={checkError} onCheck={runCheck} />
 
       {notice ? (
         <div className="mt-6">
