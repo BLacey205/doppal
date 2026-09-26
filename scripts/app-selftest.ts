@@ -83,8 +83,26 @@
  *      provider (hermetic: stubbed upstream, memory store) is the only thing
  *      that turns the state to "Connected", with when and where; and the
  *      owner's steps render in the declared order with the standing line.
+ *  19. the Model connection card: a customer's own key, handled so that a
+ *      leak is structurally impossible. Without MODEL_ENCRYPTION_KEY nothing
+ *      is stored and the missing secret is named; the provider's own refusal
+ *      (a real authenticated validation call, stubbed hermetically) becomes a
+ *      typed failure with the key scrubbed out of it, nothing is stored, no
+ *      log line carries the key, and the rules engine keeps running; on a
+ *      passing validation the state is Connected with a MASK (never the key
+ *      — checked across every view model and the rendered HTML), the
+ *      pipeline authenticates with the customer's key ahead of any platform
+ *      env key, remove genuinely deletes, and removed/failing/undecryptable
+ *      credentials all fall back to the labelled rules path.
  */
-import { heuristicDates, heuristicDraft, heuristicImportance, aiStatus } from "../src/lib/ai";
+import {
+  extractDates,
+  heuristicDates,
+  heuristicDraft,
+  heuristicImportance,
+  rankImportance,
+  aiStatus,
+} from "../src/lib/ai";
 import { fromStructured, parseRawEmail } from "../src/lib/email-parse";
 import { addDateToCalendar, ingestEmail } from "../src/lib/ingest";
 import {
@@ -145,6 +163,23 @@ import { ConnectionsSection } from "../src/components/channel-ui";
 import { noteChannelCheck, resetChannelEvidence } from "../src/lib/channel-evidence";
 import { channelStatuses, runChannelChecks } from "../src/lib/channels";
 import { channelView } from "../src/lib/channel-view";
+import {
+  MODEL_ENCRYPTION_KEY_ENV,
+  MODEL_PROVIDERS,
+  SCOPE_NOTE,
+  credentialCard,
+  getValidatedCredential,
+  maskFor,
+  providerFromStoredRow,
+  removeModelCredential,
+  resetModelCredentialState,
+  saveModelCredential,
+  scrubProviderDetail,
+  type CredentialRow,
+} from "../src/lib/model-credentials";
+import { PROVIDER_CHOICES, modelCredentialView } from "../src/lib/model-credential-view";
+import { ModelConnectionSection } from "../src/components/model-credential-ui";
+import { setModelTransportForTests, type ModelTransport } from "../src/lib/model-transport";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { AlertState, AlertStatus, StorageStatus } from "../src/lib/inbox-types";
@@ -313,10 +348,10 @@ async function main() {
   check("newsletter draft says no reply is needed", /no reply needed/i.test(noReply), noReply);
 
   console.log("\n5. Which mode produced the output is always reported");
-  check("no key → heuristic mode", aiStatus().mode === "heuristic", aiStatus());
-  check("heuristic label says so in words", /rules/i.test(aiStatus().label), aiStatus().label);
+  check("no key → heuristic mode", (await aiStatus()).mode === "heuristic", await aiStatus());
+  check("heuristic label says so in words", /rules/i.test((await aiStatus()).label), (await aiStatus()).label);
   process.env.OPENAI_API_KEY = "test-key-not-used-for-a-call";
-  const withKey = aiStatus();
+  const withKey = await aiStatus();
   check("a key present → model mode, named", withKey.mode === "model" && /openai/.test(withKey.provider), withKey);
   delete process.env.OPENAI_API_KEY;
 
@@ -948,8 +983,9 @@ async function main() {
 
   const claimsSaved = (status: StorageStatus): boolean =>
     /saved to the connected database/i.test(status.label);
+  const aiForCard = await aiStatus();
   const cardHtml = (status: StorageStatus): string =>
-    renderToStaticMarkup(React.createElement(ModeCard, { ai: aiStatus(), storage: status }));
+    renderToStaticMarkup(React.createElement(ModeCard, { ai: aiForCard, storage: status }));
 
   // (a) Nothing configured at all: the preview wording, unchanged.
   delete process.env.DATABASE_URL;
@@ -2031,6 +2067,366 @@ async function main() {
     "sms card wrong",
   );
 
+  /* ---------------------------------------------------------------- *
+   * 19. The Model connection card: a customer's own key, handled so a
+   *     leak is structurally impossible. Hermetic: the provider upstream
+   *     is a stub transport, the store is the stand-in (no database).
+   * ---------------------------------------------------------------- */
+  console.log("\n19. The Model connection card: validate before storing, encrypt at rest, leak nothing, fall back safely");
+  const TEST_KEY = "sk-test-selftest-9f3ac21b77"; // a fixture, never a real credential
+  const TEST_SECRET = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"; // 64 hex digits -> the AES-256 key
+  const ENV_KEY = "sk-env-fallback-1234567890abcdef";
+  const OPENAI_CHAT_REPLY = {
+    choices: [{ message: { content: '{"score": 88, "reason": "The model ranked this.", "needsReply": true}' } }],
+  };
+  // The stub upstream: records every request so the checks can prove WHICH key
+  // was sent, to WHICH url, and how many times.
+  const upstreamCalls: { url: string; method: string; headers: Record<string, string>; body: string }[] = [];
+  type UpstreamAnswer = { status: number; body: string } | { throwMessage: string };
+  let nextUpstream: UpstreamAnswer = { status: 200, body: "{}" };
+  const stubTransport: ModelTransport = async (request) => {
+    upstreamCalls.push({ url: request.url, method: request.method, headers: request.headers, body: request.body });
+    if ("throwMessage" in nextUpstream) throw new Error(nextUpstream.throwMessage);
+    return { status: nextUpstream.status, body: nextUpstream.body };
+  };
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.DATABASE_URL;
+  delete process.env[MODEL_ENCRYPTION_KEY_ENV];
+  setModelTransportForTests(stubTransport);
+  resetModelCredentialState();
+
+  // 19a. Without the encryption secret the flow refuses to store ANYTHING and
+  // names the missing secret — never plaintext, never a "saved" claim.
+  console.log("\n19a. No MODEL_ENCRYPTION_KEY: storing is refused, and the missing secret is named");
+  const noSecret = await saveModelCredential("openai", TEST_KEY);
+  check("19a the save is refused", noSecret.ok === false && !noSecret.ok && noSecret.code === "encryption_unavailable", noSecret);
+  check(
+    "19a the refusal names the exact secret and says nothing was saved",
+    !noSecret.ok && noSecret.message.includes("MODEL_ENCRYPTION_KEY") && noSecret.message.includes("Nothing was saved"),
+    !noSecret.ok ? noSecret.message : noSecret,
+  );
+  check("19a nothing reached the provider at all", upstreamCalls.length === 0, upstreamCalls.length);
+  check("19a no credential is usable by the pipeline", (await getValidatedCredential()) === null);
+  const cardNoSecret = await credentialCard();
+  check(
+    "19a the card records the refusal and names the secret, claiming no connection",
+    cardNoSecret.state === "failed" && cardNoSecret.message.includes("MODEL_ENCRYPTION_KEY"),
+    cardNoSecret.state,
+  );
+  const rulesStatus = await aiStatus();
+  check(
+    "19a with nothing stored the engine is the labelled rules path",
+    rulesStatus.mode === "heuristic" && rulesStatus.provider === "heuristic",
+    rulesStatus,
+  );
+
+  // 19b. The provider refuses the key: a typed failure, the provider's own
+  // words scrubbed of the key, nothing stored, and the rules still running.
+  console.log("\n19b. Validation refusal: typed failure, the key never appears anywhere, rules keep working");
+  process.env[MODEL_ENCRYPTION_KEY_ENV] = TEST_SECRET;
+  nextUpstream = {
+    status: 401,
+    body: JSON.stringify({
+      error: {
+        message: `Incorrect API key provided: ${TEST_KEY}. You can find your API key at https://platform.openai.com/account/api-keys.`,
+      },
+    }),
+  };
+  const errorLines: string[] = [];
+  const realConsoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    errorLines.push(args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "));
+  };
+  const refusedSave = await saveModelCredential("openai", TEST_KEY);
+  console.error = realConsoleError;
+  check("19b the save is refused with the typed code", !refusedSave.ok && refusedSave.code === "invalid_key", refused);
+  check(
+    "19b the refusal says the provider refused it and nothing was saved",
+    !refusedSave.ok && refusedSave.message.includes("refused this key") && refusedSave.message.includes("nothing was saved"),
+    !refusedSave.ok ? refusedSave.message : refused,
+  );
+  check(
+    "19b the provider's echoed key fragment is scrubbed out of the surfaced words",
+    !refusedSave.ok && refusedSave.message.includes("[redacted]") && !refusedSave.message.includes(TEST_KEY),
+    !refusedSave.ok ? refusedSave.message : refused,
+  );
+  check("19b exactly one upstream call was made (one validation, nothing more)", upstreamCalls.length === 1, upstreamCalls.length);
+  check(
+    "19b the validation call was the provider's models endpoint with the key ONLY in the auth header",
+    upstreamCalls[0]!.url === MODEL_PROVIDERS.openai.validationUrl &&
+      upstreamCalls[0]!.method === "GET" &&
+      upstreamCalls[0]!.headers.authorization === `Bearer ${TEST_KEY}` &&
+      !upstreamCalls[0]!.url.includes(TEST_KEY),
+    upstreamCalls[0],
+  );
+  check(
+    "19b no log line carries the key (every failure line is a string without it)",
+    errorLines.length > 0 && errorLines.every((line) => !line.includes(TEST_KEY)),
+    errorLines.length,
+  );
+  check("19b nothing is stored: the pipeline still has no credential", (await getValidatedCredential()) === null);
+  const cardRefused = await credentialCard();
+  check(
+    "19b the card's failed state carries the typed reason",
+    cardRefused.state === "failed" && cardRefused.failure?.code === "invalid_key",
+    cardRefused.state,
+  );
+  const htmlRefused = renderToStaticMarkup(
+    React.createElement(ModelConnectionSection, { card: modelCredentialView(cardRefused) }),
+  );
+  check("19b the rendered card shows Failed, never Connected", htmlRefused.includes("Failed") && !htmlRefused.includes(">Connected<"), "chip wrong");
+  check("19b the rendered card carries no key value", !htmlRefused.includes(TEST_KEY), "LEAK");
+  const rulesAfterRefusal = await rankImportance(urgentEmail, 0);
+  check(
+    "19b the rules engine still works after a refusal, labelled as rules",
+    rulesAfterRefusal.mode === "heuristic" && typeof rulesAfterRefusal.value.score === "number" && Boolean(rulesAfterRefusal.note),
+    rulesAfterRefusal.mode,
+  );
+  check("19b the refused save consumed nothing further upstream", upstreamCalls.length === 1, upstreamCalls.length);
+
+  // 19c. The provider accepts: connected means a REAL validation succeeded,
+  // the card shows only a mask, and the pipeline switches to the model.
+  console.log("\n19c. Validation success: connected, the pipeline uses the customer's key, the label changes");
+  nextUpstream = { status: 200, body: JSON.stringify({ data: [{ id: "gpt-4o-mini" }] }) };
+  const saved = await saveModelCredential("openai", TEST_KEY);
+  check("19c the save succeeds and reports connected", saved.ok && saved.state === "connected", saved);
+  check(
+    "19c the mask is provider prefix plus last four only",
+    saved.ok && saved.mask === maskFor("openai", TEST_KEY) && saved.mask === "sk-\u20261b77",
+    saved.ok ? saved.mask : saved,
+  );
+  check(
+    "19c the connected message names the engine tag and the validation time",
+    saved.ok && saved.message.includes("openai:gpt-4o-mini") && /\d{4}-\d{2}-\d{2} at \d{2}:\d{2} UTC/.test(saved.validatedAtLabel),
+    saved.ok ? saved.message : saved,
+  );
+  check(
+    "19c without a database the row is honestly said to live in the session preview",
+    saved.ok && saved.where === "memory" && saved.message.includes("in-memory preview only"),
+    saved.ok ? saved.where : saved,
+  );
+  const cardConnected = await credentialCard();
+  check(
+    "19c the card says connected, with the engine tag, the mask and the validation date",
+    cardConnected.state === "connected" &&
+      cardConnected.engineTag === "openai:gpt-4o-mini" &&
+      cardConnected.mask === "sk-\u20261b77" &&
+      cardConnected.validatedAtLabel !== null &&
+      cardConnected.honesty === null,
+    cardConnected.state,
+  );
+  const viewConnected = modelCredentialView(cardConnected);
+  check(
+    "19c the view shows the Connected chip in emerald with no failure line",
+    viewConnected.chip === "Connected" && viewConnected.tone === "emerald" && viewConnected.failureLine === null,
+    viewConnected.chip,
+  );
+  const htmlConnected = renderToStaticMarkup(
+    React.createElement(ModelConnectionSection, { card: viewConnected }),
+  );
+  check("19c the rendered card shows Connected and the mask", htmlConnected.includes(">Connected<") && htmlConnected.includes("sk-\u20261b77"), "mask or chip missing");
+  check("19c the rendered card offers Replace and Remove", htmlConnected.includes("Replace key") && htmlConnected.includes("Remove key"), "controls missing");
+  check("19c the rendered card carries the privacy block", htmlConnected.includes("never shown back") && htmlConnected.includes("AES-256-GCM"), "privacy copy missing");
+  // The leak rule, on every view model produced in this section:
+  const leakedSomewhere = [JSON.stringify(cardConnected), JSON.stringify(viewConnected), JSON.stringify(saved), htmlConnected].find(
+    (text) => text.includes(TEST_KEY),
+  );
+  check("19c the key value appears in NO view model and NO rendered HTML", leakedSomewhere === undefined, leakedSomewhere?.slice(0, 80));
+  const statusConnected = await aiStatus();
+  check(
+    "19c the engine label is now the model, named openai:gpt-4o-mini",
+    statusConnected.mode === "model" && statusConnected.provider === "openai:gpt-4o-mini" && /openai gpt-4o-mini/.test(statusConnected.label),
+    statusConnected,
+  );
+  nextUpstream = { status: 200, body: JSON.stringify(OPENAI_CHAT_REPLY) };
+  const rankedByCustomerKey = await rankImportance(urgentEmail, 0);
+  check(
+    "19c the pipeline used the model and said so",
+    rankedByCustomerKey.mode === "model" && rankedByCustomerKey.provider === "openai:gpt-4o-mini" && rankedByCustomerKey.value.score === 88,
+    { mode: rankedByCustomerKey.mode, score: rankedByCustomerKey.value.score },
+  );
+  const lastCall = upstreamCalls[upstreamCalls.length - 1]!;
+  check(
+    "19c the pipeline authenticated with the CUSTOMER's key, not a platform one",
+    lastCall.url === "https://api.openai.com/v1/chat/completions" && lastCall.headers.authorization === `Bearer ${TEST_KEY}`,
+    lastCall.url,
+  );
+  check("19c the pipeline outcome carries no key value", !JSON.stringify(rankedByCustomerKey).includes(TEST_KEY), "LEAK");
+
+  // 19d. Precedence and the way back: the customer key beats the env key; a
+  // removed key falls back to the env key, then to the labelled rules path.
+  console.log("\n19d. Precedence: customer key > platform env key > labelled rules, surviving remove and restore");
+  process.env.OPENAI_API_KEY = ENV_KEY;
+  nextUpstream = { status: 200, body: JSON.stringify(OPENAI_CHAT_REPLY) };
+  await rankImportance(urgentEmail, 0);
+  check(
+    "19d with both present, the customer's stored key is the one the pipeline uses",
+    upstreamCalls[upstreamCalls.length - 1]!.headers.authorization === `Bearer ${TEST_KEY}`,
+    upstreamCalls[upstreamCalls.length - 1]!.headers.authorization,
+  );
+  const removed = await removeModelCredential();
+  check(
+    "19d remove genuinely deletes: it says so, and nothing is usable afterwards",
+    removed.ok && removed.removed === true && removed.message.includes("genuinely deleted") && (await getValidatedCredential()) === null,
+    removed,
+  );
+  const cardRemoved = await credentialCard();
+  check("19d after remove the card is honestly not connected", cardRemoved.state === "not_connected", cardRemoved.state);
+  nextUpstream = { status: 200, body: JSON.stringify(OPENAI_CHAT_REPLY) };
+  await rankImportance(urgentEmail, 0);
+  check(
+    "19d with the stored key gone, the platform env key takes over as fallback",
+    upstreamCalls[upstreamCalls.length - 1]!.headers.authorization === `Bearer ${ENV_KEY}`,
+    upstreamCalls[upstreamCalls.length - 1]!.headers.authorization,
+  );
+  delete process.env.OPENAI_API_KEY;
+  const statusAfterRemove = await aiStatus();
+  check(
+    "19d with no key at all the engine returns to the labelled rules path",
+    statusAfterRemove.mode === "heuristic" && /rules/i.test(statusAfterRemove.label),
+    statusAfterRemove,
+  );
+  nextUpstream = { status: 200, body: JSON.stringify({ data: [{ id: "gpt-4o-mini" }] }) };
+  const restored = await saveModelCredential("openai", TEST_KEY);
+  const statusRestored = await aiStatus();
+  check(
+    "19d a re-saved key goes straight back to the model path",
+    restored.ok && statusRestored.mode === "model" && statusRestored.provider === "openai:gpt-4o-mini",
+    statusRestored,
+  );
+
+  // 19e. A credential that stops working can never break the app: the rules
+  // fallback survives a failing upstream, with the failure note preserved.
+  console.log("\n19e. A failing credential degrades to the labelled rules path — the app keeps working");
+  nextUpstream = { status: 500, body: '{"error":{"message":"upstream on fire"}}' };
+  const degraded = await rankImportance(urgentEmail, 0);
+  check(
+    "19e the model refusal falls back to the rules, with the note on the output",
+    degraded.mode === "heuristic" && typeof degraded.value.score === "number" && Boolean(degraded.note) && (degraded.note ?? "").includes("built-in rules"),
+    { mode: degraded.mode, note: degraded.note },
+  );
+  check("19e the degraded outcome carries no key value", !JSON.stringify(degraded).includes(TEST_KEY), "LEAK");
+  const extractDegraded = await extractDates(urgentEmail);
+  check("19e dates still work on the rules path", extractDegraded.mode === "heuristic" && Array.isArray(extractDegraded.value), extractDegraded.mode);
+
+  // 19f. The pure row decision: no proof, no use; undecryptable, no use.
+  console.log("\n19f. A row without a real validation is never used; an undecryptable row is never used");
+  const unvalidatedRow: CredentialRow = {
+    id: "9",
+    scope: "workspace",
+    provider: "openai",
+    model: "gpt-4o-mini",
+    encryptedKey: "Zm9vYmFy",
+    iv: "YmFyZm9v",
+    authTag: "YmF6YmF0",
+    mask: "sk-\u20269xyz",
+    validatedAt: null,
+    createdAt: "2026-09-24T10:00:00.000Z",
+    updatedAt: "2026-09-24T10:00:00.000Z",
+  };
+  check("19f a stored row with no validated_at is never used by the pipeline", providerFromStoredRow(unvalidatedRow) === null, "used!");
+  const undecryptableRow: CredentialRow = { ...unvalidatedRow, validatedAt: "2026-09-24T10:00:00.000Z" };
+  check("19f a row that cannot be decrypted (secret changed) is never used", providerFromStoredRow(undecryptableRow) === null, "used!");
+  const scrubbed = scrubProviderDetail(`Incorrect API key provided: ${TEST_KEY} and more words`, TEST_KEY);
+  check("19f the scrubber removes the key and its fragments", !scrubbed.includes(TEST_KEY) && scrubbed.includes("[redacted]"), scrubbed);
+  check("19f the anthropic mask names its own prefix", maskFor("anthropic", TEST_KEY) === "sk-ant-\u20261b77", maskFor("anthropic", TEST_KEY));
+  check(
+    "19f the card's copy names the single-workspace scope plainly",
+    SCOPE_NOTE.includes("one shared connection") && SCOPE_NOTE.includes("not one per account"),
+    SCOPE_NOTE,
+  );
+
+  // 19g. A store that refuses the write: a typed refusal, no memory fallback,
+  // and a card that refuses to claim anything.
+  console.log("\n19g. A refusing store: nothing is stored, nothing is claimed, no silent memory fallback");
+  const failingExec: QueryExecutor = async () => {
+    throw new Error("connection refused");
+  };
+  nextUpstream = { status: 200, body: JSON.stringify({ data: [{ id: "gpt-4o-mini" }] }) };
+  resetModelCredentialState();
+  const storeRefused = await saveModelCredential("openai", TEST_KEY, failingExec);
+  check(
+    "19g the save reports the store failure as a typed refusal",
+    !storeRefused.ok && storeRefused.code === "store_failed" && storeRefused.message.includes("saving it failed"),
+    storeRefused.ok ? "unexpectedly ok" : storeRefused.message,
+  );
+  check("19g the store refusal carries no key value", !storeRefused.ok && !storeRefused.message.includes(TEST_KEY), "LEAK");
+  resetModelCredentialState();
+  const cardAfterStoreFailure = await credentialCard();
+  check(
+    "19g after a failed store the card claims nothing is connected (memory store really is empty)",
+    cardAfterStoreFailure.state === "not_connected" && (await getValidatedCredential()) === null,
+    cardAfterStoreFailure.state,
+  );
+
+  // 19h. The saved-but-not-confirmed state: a stored row without proof of
+  // validation is shown as exactly that, and never as connected.
+  console.log("\n19h. Saved-but-not-confirmed: a row without validation proof never reads as connected");
+  const savedUnconfirmedCard = modelCredentialView({
+    state: "saved_unconfirmed",
+    providerId: "openai",
+    providerLabel: "OpenAI",
+    model: "gpt-4o-mini",
+    engineTag: null,
+    mask: "sk-\u20261b77",
+    savedAtLabel: "2026-09-24 at 10:00 UTC",
+    validatedAtLabel: null,
+    message: "A key row is stored, but no successful validation is recorded for it, so the pipeline is not using it.",
+    honesty: "The pipeline is NOT using this key — without a real validation it is never used.",
+    failure: null,
+    scopeNote: SCOPE_NOTE,
+  });
+  const htmlUnconfirmed = renderToStaticMarkup(
+    React.createElement(ModelConnectionSection, { card: savedUnconfirmedCard }),
+  );
+  check("19h the chip says Saved, not confirmed — not Connected", savedUnconfirmedCard.chip === "Saved, not confirmed" && !htmlUnconfirmed.includes(">Connected<"), savedUnconfirmedCard.chip);
+  check("19h the honesty line says the pipeline is not using it", htmlUnconfirmed.includes("NOT using this key"), "honesty missing");
+  // The entry form — provider choice, masked entry — renders in the
+  // not-connected state, with the honest cost lines and a password field.
+  const notConnectedView = modelCredentialView({
+    state: "not_connected",
+    providerId: null,
+    providerLabel: null,
+    model: null,
+    engineTag: null,
+    mask: null,
+    savedAtLabel: null,
+    validatedAtLabel: null,
+    message: "No model key is saved.",
+    honesty: "The pipeline is on the built-in rules right now.",
+    failure: null,
+    scopeNote: SCOPE_NOTE,
+  });
+  const htmlEntry = renderToStaticMarkup(React.createElement(ModelConnectionSection, { card: notConnectedView }));
+  // React escapes apostrophes in rendered text, so compare against the escaped form.
+  const htmlHas = (needle: string, hay: string): boolean => hay.includes(needle.replace(/'/g, "&#x27;"));
+  check(
+    "19h the entry form offers both providers, each with its own honest cost line",
+    PROVIDER_CHOICES.every((choice) => htmlHas(choice.costLine.slice(0, 60), htmlEntry)) && htmlEntry.includes("OpenAI") && htmlEntry.includes("Anthropic"),
+    "cost line missing",
+  );
+  check("19h the key field is password-style and never autofilled", htmlEntry.includes('type="password"') && /autocomplete="off"/i.test(htmlEntry), "input wrong");
+  const inputTag = htmlEntry.slice(
+    htmlEntry.indexOf('id="model-key-input"'),
+    htmlEntry.indexOf(">", htmlEntry.indexOf('id="model-key-input"')),
+  );
+  check(
+    "19h the entry form carries no key value; the sk-\u2026 on it is the placeholder hint, not a mask",
+    !htmlEntry.includes(TEST_KEY) && !/value="[^"]+"/.test(inputTag) && htmlEntry.includes("never shown back to you after saving"),
+    "LEAK",
+  );
+  const viewCostsMatch = PROVIDER_CHOICES.every(
+    (choice) => MODEL_PROVIDERS[choice.id].costLine === choice.costLine,
+  );
+  check("19h the card's cost lines are the same sentences the provider registry carries", viewCostsMatch, "cost copy drifted");
+  check(
+    "19h both providers the seam can speak are offered, and only those",
+    PROVIDER_CHOICES.length === 2 && PROVIDER_CHOICES.map((choice) => choice.id).join(",") === "openai,anthropic",
+    PROVIDER_CHOICES.map((choice) => choice.id),
+  );
+
+  // Leave no trace: the secrets, the connection string, the remembered ids,
   // Leave no trace: the secrets, the connection string, the remembered ids,
   // the rate-limit bucket, the channel evidence and the storage evidence.
   delete process.env[RESEND_WEBHOOK_SECRET_ENV];

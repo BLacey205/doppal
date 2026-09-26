@@ -57,9 +57,9 @@ export const getInbox = createServerFn({ method: "GET" }).handler(async (): Prom
   // it has to reflect what this read just did, not what the environment claims.
   const storage = storageStatus();
   if (!result.ok) {
-    return { ok: false, message: result.message, emails: [], ai: aiStatus(), storage, alerts };
+    return { ok: false, message: result.message, emails: [], ai: await aiStatus(), storage, alerts };
   }
-  return { ok: true, emails: result.value, ai: aiStatus(), storage, alerts };
+  return { ok: true, emails: result.value, ai: await aiStatus(), storage, alerts };
 });
 
 export const getEmailView = createServerFn({ method: "GET" })
@@ -67,7 +67,7 @@ export const getEmailView = createServerFn({ method: "GET" })
   .handler(async ({ data }): Promise<EmailView> => {
     const { getEmail, listCalendarEvents, storageStatus } = await import("~/lib/inbox-server");
     const { aiStatus } = await import("~/lib/ai");
-    const ai = aiStatus();
+    const ai = await aiStatus();
 
     if (!/^\d+$/.test(data.id)) {
       return {
@@ -106,8 +106,8 @@ export const getCalendar = createServerFn({ method: "GET" }).handler(async (): P
   const result = await listCalendarEvents();
   // Evidence-based: taken after the read so it reports what the read did.
   const storage = storageStatus();
-  if (!result.ok) return { ok: false, message: result.message, events: [], ai: aiStatus(), storage };
-  return { ok: true, events: result.value, ai: aiStatus(), storage };
+  if (!result.ok) return { ok: false, message: result.message, events: [], ai: await aiStatus(), storage };
+  return { ok: true, events: result.value, ai: await aiStatus(), storage };
 });
 
 /* -------------------------------- ingestion -------------------------------- */

@@ -4,9 +4,12 @@
  * Everything AI-shaped in this app goes through here: importance ranking,
  * date/time extraction, and reply drafting. Two rules hold it together:
  *
- *  1. **One provider seam.** `getProvider()` reads `OPENAI_API_KEY`, then falls
- *     back to `ANTHROPIC_API_KEY`. No other module reads either variable.
- *  2. **A labelled deterministic fallback.** With no key connected (today), every
+ *  1. **One provider seam.** The pipeline resolves its credential through
+ *     `activeProvider()`: a customer's *validated* key
+ *     (`~/lib/model-credentials`) first, then `getProvider()` reading
+ *     `OPENAI_API_KEY` and falling back to `ANTHROPIC_API_KEY`. No other module
+ *     reads either variable.
+ *  2. **A labelled deterministic fallback.** With no usable key, every
  *     function runs a keyword/regex/template heuristic and reports
  *     `mode: "heuristic"`. The UI prints that mode next to the output, so a rules
  *     result is never dressed up as a model result — and if a model call fails we
@@ -18,6 +21,7 @@
 
 import type { AiMode, AiStatus, DateCandidate, Importance } from "~/lib/inbox-types";
 import { failureLogLine } from "~/lib/log-line";
+import { modelTransport } from "~/lib/model-transport";
 
 export type EmailForAi = {
   fromLabel: string;
@@ -48,7 +52,7 @@ const MODEL_TIMEOUT_MS = 20_000;
 
 type Provider = { name: "openai" | "anthropic"; model: string; key: string };
 
-/** The single place a model credential is read. */
+/** The single place a *platform-level* model credential is read. */
 export function getProvider(): Provider | null {
   const openai = process.env.OPENAI_API_KEY?.trim();
   if (openai) {
@@ -65,11 +69,25 @@ export function getProvider(): Provider | null {
   return null;
 }
 
+/**
+ * What the pipeline actually uses right now: a **customer's validated
+ * credential** first (`~/lib/model-credentials` — a key is only ever usable
+ * because a real validation call succeeded), then the platform env key, then
+ * nothing (the rules engine runs, labelled as such). Dynamically imported so
+ * the credential module (and its database handle) never joins a client bundle.
+ */
+async function activeProvider(): Promise<Provider | null> {
+  const { getValidatedCredential } = await import("~/lib/model-credentials");
+  const stored = await getValidatedCredential();
+  if (stored) return { name: stored.name, model: stored.model, key: stored.key };
+  return getProvider();
+}
+
 const HEURISTIC_STATUS: AiStatus = {
   mode: "heuristic",
   provider: "heuristic",
   label: "Built-in rules — no model key connected yet",
-  note: "Ranking, date extraction and drafting are running on deterministic keyword and regex rules. Connect OPENAI_API_KEY (or ANTHROPIC_API_KEY) in Settings → Secrets and the same pipeline starts using the model — no code change, no redeploy of the app logic.",
+  note: "Ranking, date extraction and drafting are running on deterministic keyword and regex rules. Connect your own model key on the Model connection card below, or set OPENAI_API_KEY (or ANTHROPIC_API_KEY) in Settings → Secrets, and the same pipeline starts using the model — no code change, no redeploy of the app logic.",
 };
 
 /**
@@ -81,14 +99,10 @@ const NO_MODEL_RESPONSE_NOTE =
   "The model didn't answer in time, so this result comes from the built-in rules instead.";
 
 /** What the UI strip shows: which producer is live right now. */
-export function aiStatus(): AiStatus {
-  const provider = getProvider();
+export async function aiStatus(): Promise<AiStatus> {
+  const provider = await activeProvider();
   if (!provider) return HEURISTIC_STATUS;
-  return {
-    mode: "model",
-    provider: `${provider.name}:${provider.model}`,
-    label: `Language model — ${provider.name} ${provider.model}`,
-  };
+  return modelStatus(provider);
 }
 
 function modelStatus(provider: Provider): AiStatus {
@@ -103,17 +117,14 @@ function modelStatus(provider: Provider): AiStatus {
 /* Model transport                                                            */
 /* -------------------------------------------------------------------------- */
 
-async function callModel(system: string, user: string): Promise<string | null> {
-  const provider = getProvider();
-  if (!provider) return null;
-
+async function callModel(system: string, user: string, provider: Provider): Promise<string | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS);
   try {
     if (provider.name === "openai") {
-      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      const res = await modelTransport()({
+        url: "https://api.openai.com/v1/chat/completions",
         method: "POST",
-        signal: controller.signal,
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${provider.key}`,
@@ -127,18 +138,19 @@ async function callModel(system: string, user: string): Promise<string | null> {
             { role: "user", content: user },
           ],
         }),
+        timeoutMs: MODEL_TIMEOUT_MS,
       });
-      if (!res.ok) {
-        console.error(`[ai] openai ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      if (res.status >= 400) {
+        console.error(`[ai] openai ${res.status}: the model call was refused — see the built-in rules fallback note on the output`);
         return null;
       }
-      const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+      const json = JSON.parse(res.body) as { choices?: Array<{ message?: { content?: string } }> };
       return json.choices?.[0]?.message?.content ?? null;
     }
 
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const res = await modelTransport()({
+      url: "https://api.anthropic.com/v1/messages",
       method: "POST",
-      signal: controller.signal,
       headers: {
         "content-type": "application/json",
         "x-api-key": provider.key,
@@ -151,12 +163,13 @@ async function callModel(system: string, user: string): Promise<string | null> {
         system,
         messages: [{ role: "user", content: user }],
       }),
+      timeoutMs: MODEL_TIMEOUT_MS,
     });
-    if (!res.ok) {
-      console.error(`[ai] anthropic ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    if (res.status >= 400) {
+      console.error(`[ai] anthropic ${res.status}: the model call was refused — see the built-in rules fallback note on the output`);
       return null;
     }
-    const json = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
+    const json = JSON.parse(res.body) as { content?: Array<{ type: string; text?: string }> };
     return json.content?.find((part) => part.type === "text")?.text ?? null;
   } catch (err) {
     console.error(failureLogLine(NO_MODEL_RESPONSE_NOTE, err, "model"));
@@ -189,7 +202,7 @@ async function withModel<T>(opts: {
   validate: (raw: unknown) => T | null;
   heuristic: () => T;
 }): Promise<AiOutcome<T>> {
-  const provider = getProvider();
+  const provider = await activeProvider();
   const fallback = (note?: string): AiOutcome<T> => ({
     value: opts.heuristic(),
     mode: "heuristic",
@@ -200,7 +213,7 @@ async function withModel<T>(opts: {
 
   if (!provider) return fallback(HEURISTIC_STATUS.note);
 
-  const text = await callModel(opts.system, opts.user);
+  const text = await callModel(opts.system, opts.user, provider);
   if (!text) {
     console.error(`[ai] ${opts.task}: no usable model response, using heuristic`);
     return fallback(NO_MODEL_RESPONSE_NOTE);

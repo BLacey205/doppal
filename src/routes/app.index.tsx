@@ -3,8 +3,15 @@ import { useEffect, useRef, useState } from "react";
 
 import { AlertsLine, AppNav, Chip, ModeCard, Notice, ScoreBadge } from "~/components/app-ui";
 import { ConnectionsSection } from "~/components/channel-ui";
+import { ModelConnectionSection } from "~/components/model-credential-ui";
 import { getChannels, runChannelsCheck } from "~/lib/channel-fns";
 import { channelView } from "~/lib/channel-view";
+import {
+  getModelCredentialCard,
+  removeModelCredentialKey,
+  saveModelCredentialKey,
+} from "~/lib/model-credential-fns";
+import { modelCredentialView } from "~/lib/model-credential-view";
 import { getInbox, ingestPastedEmail, loadSampleInbox } from "~/lib/inbox";
 
 export const Route = createFileRoute("/app/")({
@@ -22,14 +29,18 @@ export const Route = createFileRoute("/app/")({
       },
     ],
   }),
-  loader: async () => ({ inbox: await getInbox(), channels: await getChannels() }),
+  loader: async () => ({
+    inbox: await getInbox(),
+    channels: await getChannels(),
+    model: await getModelCredentialCard(),
+  }),
   component: AppInbox,
 });
 
 type FeedNotice = { tone: "amber" | "emerald" | "rose"; message: string } | null;
 
 function AppInbox() {
-  const { inbox: view, channels: initialChannels } = Route.useLoaderData();
+  const { inbox: view, channels: initialChannels, model: initialModel } = Route.useLoaderData();
   const router = useRouter();
   const [raw, setRaw] = useState("");
   const [busy, setBusy] = useState<null | "paste" | "sample">(null);
@@ -40,6 +51,46 @@ function AppInbox() {
   const [channels, setChannels] = useState(() => initialChannels.channels.map(channelView));
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
+
+  // Model connection: the customer's own key. The server returns only a mask
+  // and timestamps — never the key itself — so nothing here can re-render it.
+  const [modelCard, setModelCard] = useState(() => initialModel.card);
+  const [modelBusy, setModelBusy] = useState<null | "save" | "remove">(null);
+  const [modelNotice, setModelNotice] = useState<FeedNotice>(null);
+
+  const saveKey = async (input: { provider: "openai" | "anthropic"; key: string }) => {
+    setModelBusy("save");
+    setModelNotice(null);
+    try {
+      const res = await saveModelCredentialKey({ data: input });
+      setModelNotice({ tone: res.ok ? "emerald" : "rose", message: res.message });
+      if (res.ok) await router.invalidate();
+      setModelCard((await getModelCredentialCard()).card);
+    } catch {
+      setModelNotice({
+        tone: "rose",
+        message: "That didn't reach the server — nothing was saved. Please try again.",
+      });
+    }
+    setModelBusy(null);
+  };
+
+  const removeKey = async () => {
+    setModelBusy("remove");
+    setModelNotice(null);
+    try {
+      const res = await removeModelCredentialKey();
+      setModelNotice({ tone: res.ok ? "emerald" : "rose", message: res.message });
+      if (res.ok) await router.invalidate();
+      setModelCard((await getModelCredentialCard()).card);
+    } catch {
+      setModelNotice({
+        tone: "rose",
+        message: "That didn't reach the server — nothing was removed. Please try again.",
+      });
+    }
+    setModelBusy(null);
+  };
 
   const runCheck = async () => {
     setChecking(true);
@@ -156,6 +207,15 @@ function AppInbox() {
 
       {/* How each channel really stands — starting with email (Resend forwarding). */}
       <ConnectionsSection channels={channels} checking={checking} checkError={checkError} onCheck={runCheck} />
+
+      {/* The customer's own model key — validated before it is ever used, encrypted at rest. */}
+      <ModelConnectionSection card={modelCredentialView(modelCard)} busy={modelBusy} onSave={saveKey} onRemove={removeKey} />
+
+      {modelNotice ? (
+        <div className="mt-4">
+          <Notice message={modelNotice.message} tone={modelNotice.tone} />
+        </div>
+      ) : null}
 
       {notice ? (
         <div className="mt-6">

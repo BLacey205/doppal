@@ -89,7 +89,7 @@ export async function ingestEmail(
   exec?: QueryExecutor,
 ): Promise<IngestResult> {
   const status = storageStatus();
-  const ai = aiStatus();
+  const ai = await aiStatus();
 
   const parsed = input.raw
     ? parseRawEmail(input.raw, input.receivedAt)
