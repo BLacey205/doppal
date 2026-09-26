@@ -59,6 +59,18 @@
  *      carries — is accepted and stored. Hermetic: the stale refusal fails
  *      before any provider call, the re-sign is judged by the same
  *      verifyResendSignature() the route runs, and the store is the stand-in.
+ *  17. a forwarded message with no readable body is stored, not refused:
+ *      Resend's documented retrieve-received-email response can carry
+ *      `"text": null` with HTML present (their own example does), and a real
+ *      forward can have no HTML either — an attachment-only forward is the
+ *      realistic case. Every such message that names a sender or a subject is
+ *      stored with the absence said plainly (a bracketed Doppel note, naming
+ *      unfetched attachments when there are any), the answer never claims text
+ *      it does not have, and only a payload that is literally nothing is still
+ *      refused with the typed error — nothing stored, nothing remembered.
+ *      Fixtures are copied from Resend's published examples (doc URLs in the
+ *      section comments); hermetic: the upstream fetch is a stub, the store is
+ *      the stand-in, no network.
  */
 import { heuristicDates, heuristicDraft, heuristicImportance, aiStatus } from "../src/lib/ai";
 import { fromStructured, parseRawEmail } from "../src/lib/email-parse";
@@ -1380,6 +1392,299 @@ async function main() {
   resetRateLimits();
   resetStorageEvidence();
   delete process.env.DATABASE_URL;
+
+  /* ---------------------------------------------------------------- *
+   * 16. A body-less forwarded message is stored, not refused
+   * ---------------------------------------------------------------- */
+
+  console.log("\n16. A forwarded message with no readable body is stored, not refused");
+
+  // The fixtures below are copied from Resend's published examples:
+  //   - the retrieve-received-email response (their own example carries
+  //     `"text": null` with an HTML body present, plus a two-entry attachments
+  //     array and a `headers.from` display name):
+  //     https://resend.com/docs/api-reference/emails/retrieve-received-email
+  //   - the email.received webhook event (ids, from, created_at):
+  //     https://resend.com/docs/webhooks/emails/received
+  //   - the retry schedule that makes a failure answer costly
+  //     (https://resend.com/docs/webhooks/retries-and-replays).
+  // Every scenario id is an id from those published examples, so each scenario
+  // has its own and the duplicate-suppression map never confuses them.
+  // Hermetic: fetch is stubbed to return the documented response, the store is
+  // the stand-in executor (or the memory store in preview), nothing leaves the
+  // process, and no message is written to any real database.
+  const DOCS_RETRIEVE_EXAMPLE = {
+    object: "email",
+    id: "4ef9a417-02e9-4d39-ad75-9611e0fcc33c",
+    to: ["delivered@resend.dev"],
+    from: "onboarding@resend.dev",
+    created_at: "2026-04-03T22:13:42.674Z",
+    subject: "Hello World",
+    html: "Congrats on sending your <strong>first email</strong>!",
+    html_format: "data_uri",
+    text: null,
+    headers: {
+      from: "Acme <onboarding@resend.dev>",
+      "return-path": "lucas.costa@resend.com",
+      "mime-version": "1.0",
+    },
+    bcc: [],
+    cc: [],
+    reply_to: [],
+    received_for: ["forwarded@example.com"],
+    authentication: { spf: "pass", dkim: "pass", dmarc: "pass" },
+    message_id: "<111-222-333@email.example.com>",
+    raw: {
+      download_url:
+        "https://example.resend.com/receiving/raw/054da427-439a-4e91-b785-e4fb1966285f?Signature=...",
+      expires_at: "2026-04-03T23:13:42.674Z",
+    },
+    attachments: [
+      {
+        id: "2a0c9ce0-3112-4728-976e-47ddcd16a318",
+        filename: "avatar.png",
+        content_type: "image/png",
+        content_disposition: "inline",
+        content_id: "img001",
+        size: 4096,
+      },
+      {
+        id: "3b1d0df1-4223-5839-087f-54eedd27b419",
+        filename: "document.pdf",
+        content_type: "application/pdf",
+        content_disposition: null,
+        content_id: null,
+        size: 13264,
+      },
+    ],
+  };
+  // The documented webhook event's `data` fields (minus email_id, which the
+  // delivery helper supplies per scenario).
+  const DOCS_EVENT_DATA = {
+    from: "onboarding@resend.dev",
+    to: ["delivered@resend.dev"],
+    received_for: ["forwarded@example.com"],
+    message_id: "<111-222-333@email.example.com>",
+  };
+  // Ids from the same published examples, one per scenario so the remembered-id
+  // map can never conflate them.
+  const IDS = {
+    htmlPresent: DOCS_RETRIEVE_EXAMPLE.id,
+    noHtml: "56761188-7520-42d8-8898-ff6fc54ce618", // the webhook example's email_id
+    attachmentsOnly: "054da427-439a-4e91-b785-e4fb1966285f", // the example's raw-download id
+    nothingAtAll: "2a0c9ce0-3112-4728-976e-47ddcd16a318", // the example's first attachment id
+  };
+
+  const upstreamReturns = (payload: Record<string, unknown>) => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    return () => {
+      globalThis.fetch = realFetch;
+    };
+  };
+  const deliverResend = async (
+    emailId: string,
+    upstream: Record<string, unknown>,
+    exec?: QueryExecutor,
+    eventData: Record<string, unknown> = DOCS_EVENT_DATA,
+  ): Promise<{ response: Response; body: Record<string, any> }> => {
+    const restore = upstreamReturns(upstream);
+    try {
+      const eventBody = JSON.stringify({
+        type: "email.received",
+        created_at: WEDNESDAY,
+        data: { email_id: emailId, created_at: WEDNESDAY, ...eventData },
+      });
+      const ts = String(Math.floor(Date.now() / 1000));
+      const response = await handleProviderWebhookPost(
+        "resend",
+        postRequest(RESEND_URL, eventBody, {
+          "svix-id": emailId,
+          "svix-timestamp": ts,
+          "svix-signature": svixSignature(emailId, ts, eventBody, SECRET),
+        }),
+        exec ? { exec } : {},
+      );
+      return { response, body: await jsonOf(response) };
+    } finally {
+      restore();
+    }
+  };
+
+  process.env[RESEND_WEBHOOK_SECRET_ENV] = SECRET;
+  process.env[RESEND_API_KEY_ENV] = "re_selftest_key_not_real";
+  process.env.DATABASE_URL = "postgresql://u:p@db.internal.example:5432/doppel";
+  resetStorageEvidence();
+  resetIngestedProviderMessages();
+  resetRateLimits();
+
+  console.log("\n16a. The documented response (\"text\": null + HTML) is stored with its HTML read");
+  const storeA = fakeDb(storePlan);
+  const a = await deliverResend(IDS.htmlPresent, DOCS_RETRIEVE_EXAMPLE, storeA.exec);
+  check(
+    "(a) stored with a retry-stopping 201 that claims a real store",
+    a.response.status === 201 && a.body.ok === true && a.body.stored === true && a.body.storage === "database",
+    { status: a.response.status, stored: a.body.stored, storage: a.body.storage },
+  );
+  check("(a) the documented subject is what the answer carries", a.body.email.subject === "Hello World", a.body.email.subject);
+  check("(a) the sender comes from the documented headers.from", a.body.email.from === "Acme <onboarding@resend.dev>", a.body.email.from);
+  const insertA = storeA.calls.find((c) => /insert into emails/i.test(c.sql));
+  check(
+    "(a) the HTML became readable text in the stored row (the documented words)",
+    String(insertA?.values?.[6] ?? "").includes("first email"),
+    insertA?.values?.[6],
+  );
+  check("(a) a message with readable text carries no absence note", !JSON.stringify(insertA?.values ?? []).includes("[Doppel note"));
+  const aRepeat = await deliverResend(IDS.htmlPresent, DOCS_RETRIEVE_EXAMPLE, storeA.exec);
+  check(
+    "(a) a replay is answered duplicate 200 — the success stopped the retries",
+    aRepeat.response.status === 200 && aRepeat.body.duplicate === true,
+    { status: aRepeat.response.status, body: aRepeat.body },
+  );
+  check("(a) ...with still exactly one insert", insertsIn(storeA.calls) === 1, insertsIn(storeA.calls));
+
+  console.log("\n16b. The same documented shape with html null too — subject present, so it is stored honestly");
+  const storeB = fakeDb(storePlan);
+  const bUpstream = { ...DOCS_RETRIEVE_EXAMPLE, html: null, attachments: [] };
+  const b = await deliverResend(IDS.noHtml, bUpstream, storeB.exec);
+  const insertB = storeB.calls.find((c) => /insert into emails/i.test(c.sql));
+  check(
+    "(b) a real message (sender + subject) with no readable body is stored 2xx, not refused",
+    b.response.status === 201 && b.body.ok === true && b.body.stored === true && insertsIn(storeB.calls) === 1,
+    { status: b.response.status, stored: b.body.stored, inserts: insertsIn(storeB.calls) },
+  );
+  check(
+    "(b) the stored body says plainly that there was no readable text",
+    String(insertB?.values?.[6] ?? "") === "[Doppel note: this message had no readable text — no plain-text or HTML body came with it.]",
+    insertB?.values?.[6],
+  );
+  check(
+    "(b) the row claims no text it does not have (no sender words, no HTML leftovers)",
+    !JSON.stringify(insertB?.values ?? []).includes("Congrats") && !JSON.stringify(insertB?.values ?? []).includes("first email"),
+    insertB?.values?.[6],
+  );
+
+  console.log("\n16c. An attachment-only forward — subject present, empty body, the documented attachments");
+  const storeC = fakeDb(storePlan);
+  const cUpstream = { ...DOCS_RETRIEVE_EXAMPLE, html: null };
+  const c = await deliverResend(IDS.attachmentsOnly, cUpstream, storeC.exec);
+  const insertC = storeC.calls.find((c) => /insert into emails/i.test(c.sql));
+  check(
+    "(c) stored with a 201 — nothing lost",
+    c.response.status === 201 && c.body.ok === true && c.body.stored === true && insertsIn(storeC.calls) === 1,
+    { status: c.response.status, stored: c.body.stored, inserts: insertsIn(storeC.calls) },
+  );
+  check(
+    "(c) the note names the two attachments that were not downloaded",
+    String(insertC?.values?.[6] ?? "") ===
+      "[Doppel note: this message had no readable text — no plain-text or HTML body came with it, and its 2 attachments were not downloaded.]",
+    insertC?.values?.[6],
+  );
+  check(
+    "(c) the answer claims no text it does not have — nothing in it quotes words the sender never wrote",
+    !JSON.stringify(c.body).includes("Congrats") && !JSON.stringify(c.body).includes("first email"),
+    c.body.email?.draft?.body,
+  );
+  check(
+    "(c) the draft declines to have read anything",
+    typeof c.body.email?.draft?.body === "string" &&
+      c.body.email.draft.body.includes("no readable text") &&
+      !/I've read it/.test(c.body.email.draft.body),
+    c.body.email?.draft?.body,
+  );
+
+  console.log("\n16d. A payload carrying literally nothing is still refused — nothing stored, nothing remembered");
+  const storeD = fakeDb(storePlan);
+  const dUpstream = {
+    object: "email",
+    id: IDS.nothingAtAll,
+    to: ["delivered@resend.dev"],
+    created_at: "2026-04-03T22:13:42.674Z",
+    bcc: [],
+    cc: [],
+    reply_to: [],
+  };
+  // The event carries no from either — no sender, no subject, no body anywhere.
+  const d = await deliverResend(IDS.nothingAtAll, dUpstream, storeD.exec, {});
+  check("(d) the typed 400 refusal, as before", d.response.status === 400 && d.body.error === "not_a_message", {
+    status: d.response.status,
+    body: d.body,
+  });
+  check("(d) nothing was stored", insertsIn(storeD.calls) === 0, insertsIn(storeD.calls));
+  const dRepeat = await deliverResend(IDS.nothingAtAll, dUpstream, storeD.exec, {});
+  check(
+    "(d) a retry gets the same refusal — no duplicate answer, nothing was remembered",
+    dRepeat.response.status === 400 && dRepeat.body.error === "not_a_message" && dRepeat.body.duplicate !== true && insertsIn(storeD.calls) === 0,
+    { status: dRepeat.response.status, body: dRepeat.body, inserts: insertsIn(storeD.calls) },
+  );
+
+  console.log("\n16e. The row the app reads back is the row the webhook claimed to store");
+  delete process.env.DATABASE_URL;
+  resetRateLimits();
+  resetIngestedProviderMessages();
+  resetStorageEvidence();
+  const emptyFunnel = await ingestEmail({ source: "paste" });
+  check(
+    "(e) the funnel still refuses a payload that is literally nothing",
+    emptyFunnel.ok === false && emptyFunnel.reason === "not_a_message",
+    emptyFunnel.ok === false ? emptyFunnel.message : emptyFunnel,
+  );
+  const senderOnly = await ingestEmail({ source: "api", from: "Dana Whitfield <dana@example.com>" });
+  check(
+    "(e) a message that has a sender but no subject and no body is kept, not refused",
+    senderOnly.ok === true && senderOnly.email.body === "[Doppel note: this message had no readable text.]",
+    senderOnly.ok ? senderOnly.email.body : senderOnly.message,
+  );
+
+  const aPreview = await deliverResend(IDS.htmlPresent, DOCS_RETRIEVE_EXAMPLE);
+  const aRow = aPreview.body.ok ? await getEmail(aPreview.body.email.id) : null;
+  check(
+    "(e) the documented example's row reads back as the webhook claimed (id, sender, subject)",
+    aPreview.response.status === 201 &&
+      aRow?.ok === true &&
+      aRow.value?.id === aPreview.body.email.id &&
+      aRow.value?.subject === aPreview.body.email.subject &&
+      aRow.value?.fromLabel === aPreview.body.email.from,
+    { claimed: aPreview.body.email, row: aRow?.value },
+  );
+  check(
+    "(e) its body is the HTML text, not an absence note",
+    aRow?.ok === true && aRow.value?.body?.includes("first email") === true && !aRow.value.body.includes("[Doppel note"),
+    aRow?.value?.body,
+  );
+  const bPreview = await deliverResend(IDS.noHtml, bUpstream);
+  const bRow = bPreview.body.ok ? await getEmail(bPreview.body.email.id) : null;
+  check(
+    "(e) the body-less row reads back with the exact honest note as its body and snippet",
+    bPreview.response.status === 201 &&
+      bRow?.ok === true &&
+      bRow.value?.body === "[Doppel note: this message had no readable text — no plain-text or HTML body came with it.]" &&
+      bRow.value?.snippet === bRow.value?.body,
+    { body: bRow?.value?.body, snippet: bRow?.value?.snippet },
+  );
+  const cPreview = await deliverResend(IDS.attachmentsOnly, cUpstream);
+  const cRow = cPreview.body.ok ? await getEmail(cPreview.body.email.id) : null;
+  check(
+    "(e) the attachment-only row reads back with the attachment-honest note",
+    cPreview.response.status === 201 &&
+      cRow?.ok === true &&
+      cRow.value?.body ===
+        "[Doppel note: this message had no readable text — no plain-text or HTML body came with it, and its 2 attachments were not downloaded.]",
+    cRow?.value?.body,
+  );
+
+  // Leave no trace: the secrets, the connection string, the remembered ids,
+  // the rate-limit bucket and the storage evidence.
+  delete process.env[RESEND_WEBHOOK_SECRET_ENV];
+  delete process.env[RESEND_API_KEY_ENV];
+  delete process.env.DATABASE_URL;
+  resetIngestedProviderMessages();
+  resetRateLimits();
+  resetStorageEvidence();
 
   console.log(failures === 0 ? "\nAll inbox checks passed.\n" : `\n${failures} check(s) FAILED.\n`);
   process.exit(failures === 0 ? 0 : 1);
