@@ -52,6 +52,13 @@
  *      with exactly one insert; and an ignored event stores and remembers nothing.
  *      Hermetic: a stand-in provider and injected executors, no network, no real
  *      database.
+ *  16. the signature freshness window cannot lose a retry: an attempt signed
+ *      beyond the tolerance is refused as stale and remembered by no one, and
+ *      the same message re-signed with a current timestamp — the same svix-id,
+ *      the same body, a fresh timestamp, which is what a retried attempt
+ *      carries — is accepted and stored. Hermetic: the stale refusal fails
+ *      before any provider call, the re-sign is judged by the same
+ *      verifyResendSignature() the route runs, and the store is the stand-in.
  */
 import { heuristicDates, heuristicDraft, heuristicImportance, aiStatus } from "../src/lib/ai";
 import { fromStructured, parseRawEmail } from "../src/lib/email-parse";
@@ -1259,6 +1266,112 @@ async function main() {
     previewRepeat.status === 200 && (await jsonOf(previewRepeat)).duplicate === true,
     previewRepeat.status,
   );
+
+  /* ---------------------------------------------------------------- *
+   * 15h. The freshness window cannot lose a retry
+   * ---------------------------------------------------------------- */
+
+  console.log(
+    "\n15h. A retry is never lost to the signature freshness window (stale refused and forgotten; re-signed fresh accepted and stored)",
+  );
+
+  // Svix's scheme signs *the attempt*: "Svix also sends the timestamp of the
+  // attempt in the svix-timestamp header" (docs.svix.com/receiving/verifying-
+  // payloads/how-manual), and the spec behind it is plainer still: "Every time
+  // an attempt is retried the timestamp of the attempt is updated, while the
+  // timestamp of the original event remains the same" (Standard Webhooks,
+  // spec/standard-webhooks.md §Timestamp). The svix-id is the same for every
+  // attempt of a message ("will be the same when the same webhook is being
+  // resent"). That combination could still cost us mail in exactly two ways,
+  // and this check rules out both:
+  //   - an attempt signed beyond the tolerance is refused as stale — fine, as
+  //     long as the refusal stores nothing and remembers NOTHING: a remembered
+  //     id would answer the provider's next attempt with `duplicate` and the
+  //     mail would be gone for good;
+  //   - the same message re-signed with a current timestamp — precisely what a
+  //     retried attempt carries — must be accepted and stored.
+  // Fully offline: the stale refusal fails before any provider call is made,
+  // the re-sign is judged by the same verifyResendSignature() call the route
+  // makes, and the store is this section's stand-in with an injected executor
+  // (the route past read() is provider-agnostic).
+  resetIngestedProviderMessages();
+  resetRateLimits();
+  resetStorageEvidence();
+  process.env[RESEND_WEBHOOK_SECRET_ENV] = SECRET;
+  // Both secrets set, so the route is armed and actually reaches the signature
+  // layer (connection() is checked first). Still offline: the stale refusal
+  // fires inside read() before any call to Resend.
+  process.env[RESEND_API_KEY_ENV] = "re_selftest_key_not_real";
+  process.env.DATABASE_URL = "postgresql://u:p@db.internal.example:5432/doppel";
+  const RETRY_ID = "msg_freshness-retry-1";
+  const retryBody = JSON.stringify({
+    type: "email.received",
+    created_at: WEDNESDAY,
+    data: { email_id: RETRY_ID, from: "marcus@example.com", subject: urgentEmail.subject, created_at: WEDNESDAY },
+  });
+  const resendAttempt = (timestamp: string) =>
+    postRequest(RESEND_URL, retryBody, {
+      "svix-id": RETRY_ID,
+      "svix-timestamp": timestamp,
+      "svix-signature": svixSignature(RETRY_ID, timestamp, retryBody, SECRET),
+    });
+
+  // (a) The attempt signed an hour ago — beyond the tolerance — is refused as stale.
+  const staleAttempt = await handleProviderWebhookPost("resend", resendAttempt(String(Math.floor(Date.now() / 1000) - 3600)));
+  const staleAttemptBody = await jsonOf(staleAttempt);
+  check(
+    "an attempt signed beyond the tolerance is refused as stale",
+    staleAttempt.status === 401 && staleAttemptBody.error === "stale_signature",
+    { status: staleAttempt.status, body: staleAttemptBody },
+  );
+  check(
+    "...and says in words that nothing was stored",
+    /nothing was stored/i.test(String(staleAttemptBody.message)),
+    staleAttemptBody.message,
+  );
+
+  // (b) The same message re-signed now — same id, same body, current timestamp —
+  // passes the very window that refused the stale attempt.
+  const nowTs = String(Math.floor(Date.now() / 1000));
+  const resigned = verifyResendSignature({
+    rawBody: retryBody,
+    id: RETRY_ID,
+    timestamp: nowTs,
+    signature: svixSignature(RETRY_ID, nowTs, retryBody, SECRET),
+    secret: SECRET,
+  });
+  check("the same message re-signed now passes the same window", resigned.ok === true, resigned);
+
+  // (c) The retried message is accepted and stored — which doubles as the proof
+  // that the stale refusal remembered nothing: a remembered id would have been
+  // answered `duplicate` with zero inserts.
+  const retryStore = fakeDb(storePlan);
+  const retryDelivery = await handleProviderWebhookPost(
+    "selftest",
+    providerPost({ providerMessageId: RETRY_ID }),
+    { exec: retryStore.exec },
+  );
+  const retryDeliveryBody = await jsonOf(retryDelivery);
+  check(
+    "the retried message is accepted and stored — the refusal was not remembered",
+    retryDelivery.status === 201 && retryDeliveryBody.duplicate !== true && insertsIn(retryStore.calls) === 1,
+    { status: retryDelivery.status, body: retryDeliveryBody, inserts: insertsIn(retryStore.calls) },
+  );
+  check(
+    "...and it claims a real store",
+    retryDeliveryBody.stored === true && retryDeliveryBody.storage === "database",
+    { stored: retryDeliveryBody.stored, storage: retryDeliveryBody.storage },
+  );
+  const retryRepeat = await handleProviderWebhookPost("selftest", providerPost({ providerMessageId: RETRY_ID }), { exec: retryStore.exec });
+  check(
+    "a later repeat of it is still answered as a duplicate, stored once",
+    retryRepeat.status === 200 && (await jsonOf(retryRepeat)).duplicate === true && insertsIn(retryStore.calls) === 1,
+    retryRepeat.status,
+  );
+
+  delete process.env[RESEND_WEBHOOK_SECRET_ENV];
+  delete process.env[RESEND_API_KEY_ENV];
+  resetRateLimits();
 
   // Leave no trace: the stand-in provider, the remembered ids, the rate-limit
   // bucket, the storage evidence and the connection string.
