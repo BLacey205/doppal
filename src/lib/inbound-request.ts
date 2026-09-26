@@ -32,6 +32,8 @@ type InboundFields = {
   subject?: string;
   text?: string;
   receivedAt?: string;
+  /** Honest reason there is no readable body (provider path only). */
+  bodyNote?: string;
   /** Set when the message came from a provider webhook, so the answer says which. */
   provider?: string;
 };
@@ -117,6 +119,7 @@ export async function ingestToOutcome(
         subject: text(input.subject),
         text: text(input.text),
         receivedAt: text(input.receivedAt) || undefined,
+        bodyNote: text(input.bodyNote) || undefined,
       },
       options.exec,
     );

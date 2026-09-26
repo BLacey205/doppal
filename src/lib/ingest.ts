@@ -32,6 +32,12 @@ export type IngestInput = {
   subject?: string;
   text?: string;
   receivedAt?: string;
+  /**
+   * Set by a provider that could read the envelope but not the body (an
+   * attachment-only forward): the honest reason there is no readable text.
+   * Never invents content — it only explains an absence.
+   */
+  bodyNote?: string;
 };
 
 export type IngestResult =
@@ -65,6 +71,19 @@ export type IngestResult =
 const EMPTY_MESSAGE =
   "That doesn't look like a message yet — paste the text of the email (the From and Subject lines help too) and try again.";
 
+/**
+ * The body stored for a real message (a sender or a subject answered for it)
+ * that arrived with no readable text. Bracketed and labelled `Doppel note:` so
+ * it can never be mistaken for words the sender wrote — in the inbox list, in
+ * the message view, or in an alert that quotes it.
+ */
+function noReadableTextBody(note?: string): string {
+  const detail = (note ?? "").trim();
+  return detail
+    ? `[Doppel note: this message had no readable text — ${detail}.]`
+    : "[Doppel note: this message had no readable text.]";
+}
+
 export async function ingestEmail(
   input: IngestInput,
   exec?: QueryExecutor,
@@ -81,16 +100,31 @@ export async function ingestEmail(
         receivedAt: input.receivedAt,
       });
 
-  if (!parsed.body.trim() && (!parsed.subject || parsed.subject === "(no subject)")) {
+  // Refuse only a payload that is nothing at all: no body, no subject, no
+  // sender. A forwarded message that names a sender or a subject is real mail
+  // even when its body couldn't be read (Resend's documented response can
+  // carry `"text": null` with no HTML either) — refusing it would answer the
+  // provider's webhook with a failure code for mail that has nowhere else to
+  // go, so it is stored with the absence said plainly instead.
+  const emptyBody = !parsed.body.trim();
+  const hasSender = Boolean(parsed.fromEmail || parsed.fromName);
+  if (emptyBody && (!parsed.subject || parsed.subject === "(no subject)") && !hasSender) {
     return { ok: false, reason: "not_a_message", message: EMPTY_MESSAGE, storage: status };
   }
+
+  // What the owner sees for a body-less message is the honest note, not an
+  // empty section and not invented text.
+  const bodyForStore = emptyBody ? noReadableTextBody(input.bodyNote) : parsed.body;
 
   const forAi: EmailForAi = {
     fromLabel: parsed.fromLabel,
     fromEmail: parsed.fromEmail,
     subject: parsed.subject,
-    body: parsed.body,
+    // Triage reads the truth — no sender words exist — and the draft learns
+    // about the absence through bodyNote.
+    body: emptyBody ? "" : parsed.body,
     receivedAt: parsed.receivedAt,
+    bodyNote: emptyBody ? (input.bodyNote ?? "no readable text arrived with it") : undefined,
   };
 
   // 1. dates (so the score can count them)  2. importance  3. draft
@@ -114,8 +148,8 @@ export async function ingestEmail(
       fromEmail: parsed.fromEmail,
       fromLabel: parsed.fromLabel,
       subject: parsed.subject,
-      snippet: snippetOf(parsed.body),
-      body: parsed.body,
+      snippet: snippetOf(bodyForStore),
+      body: bodyForStore,
       raw: input.raw ?? JSON.stringify({ from: input.from, subject: input.subject }),
       receivedAt: parsed.receivedAt,
       score: importance.value.score,
@@ -152,8 +186,8 @@ export async function ingestEmail(
     fromEmail: parsed.fromEmail,
     fromLabel: parsed.fromLabel,
     subject: parsed.subject,
-    snippet: snippetOf(parsed.body),
-    body: parsed.body,
+    snippet: snippetOf(bodyForStore),
+    body: bodyForStore,
     receivedAt: parsed.receivedAt,
     receivedAtLabel: formatReceived(parsed.receivedAt),
     importance: importance.value,

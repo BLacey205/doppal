@@ -53,6 +53,12 @@ export type InboundMessage = {
   subject: string;
   text: string;
   receivedAt?: string;
+  /**
+   * Set when the message is real but no readable text could be read from it —
+   * the honest reason there is no body, handed to the funnel so the stored row
+   * can say so plainly. An explanation of an absence, never content.
+   */
+  bodyNote?: string;
   /** Provider-side id, so a retried webhook doesn't ingest the same mail twice. */
   providerMessageId: string | null;
 };
@@ -376,7 +382,23 @@ export const resendProvider: InboundProvider = {
     const body = fetched.body;
     const bodyHeaders = (body.headers ?? {}) as Record<string, unknown>;
     const from = asText(bodyHeaders.from) || asText(body.from) || asText(data.from);
+    // Resend's documented response can carry `"text": null` (their own example
+    // does) and a real forward can have no HTML either — an attachment-only
+    // forward is the realistic case. Both empty must NOT become a silent empty
+    // string the funnel has to guess about: the note rides along so the stored
+    // row says why there is no text, and the message is kept rather than
+    // refused. See the selftest fixtures from Resend's published examples.
     const text = asText(body.text) || htmlToText(asText(body.html));
+    let bodyNote: string | undefined;
+    if (!text.trim()) {
+      const attachmentCount = Array.isArray(body.attachments) ? body.attachments.length : 0;
+      bodyNote =
+        attachmentCount > 0
+          ? `no plain-text or HTML body came with it, and its ${attachmentCount} attachment${
+              attachmentCount === 1 ? " was" : "s were"
+            } not downloaded`
+          : "no plain-text or HTML body came with it";
+    }
 
     return {
       ok: true,
@@ -386,6 +408,7 @@ export const resendProvider: InboundProvider = {
         subject: asText(body.subject) || asText(data.subject),
         text,
         receivedAt: asText(data.created_at) || asText(body.created_at) || undefined,
+        bodyNote,
         providerMessageId: emailId,
       },
     };

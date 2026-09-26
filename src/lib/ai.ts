@@ -25,6 +25,12 @@ export type EmailForAi = {
   subject: string;
   body: string;
   receivedAt: string;
+  /**
+   * Set only when the message is real but arrived with no readable text (an
+   * attachment-only forward, say). The draft then says so instead of claiming
+   * to have read words that never arrived.
+   */
+  bodyNote?: string;
 };
 
 export type AiOutcome<T> = {
@@ -670,6 +676,19 @@ export function heuristicDraft(
       ? `I've put ${when.label} in the diary.`
       : `I've put ${when.label} in the diary — that works on my end.`
     : "";
+
+  // A real message that arrived with no readable text: say so, and draft no
+  // reply — pretending to have read the sender's words would be the one thing
+  // this draft must never do.
+  if (email.bodyNote) {
+    return [
+      greeting,
+      "",
+      `This message arrived with no readable text — it may have carried only attachments, or the format didn't survive the forward.`,
+      "",
+      "Doppel hasn't drafted a reply, because there's nothing here to answer yet. Ask the sender to resend it, or read the original at the source.",
+    ].join("\n");
+  }
 
   if (hits(BULK, text).length >= 1 && !hints.needsReply) {
     return [
