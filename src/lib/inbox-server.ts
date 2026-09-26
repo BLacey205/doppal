@@ -284,7 +284,14 @@ function backendFor(
   return { kind: "memory" };
 }
 
-const ok = <T>(value: T): StoreResult<T> => ({ ok: true, value, storage: storageStatus() });
+// Narrow on purpose: `ok()` can only ever build the success variant, so callers
+// that add a field to its result (`{ ...ok(...), storedIn: "database" }`) stay
+// assignable to StoreResult instead of being widened to the failure variant too.
+const ok = <T>(value: T): Extract<StoreResult<T>, { ok: true }> => ({
+  ok: true,
+  value,
+  storage: storageStatus(),
+});
 const fail = <T>(message: string): StoreResult<T> => ({ ok: false, message, storage: storageStatus() });
 
 /* -------------------------------------------------------------------------- */
