@@ -1642,39 +1642,42 @@ async function main() {
 
   const aPreview = await deliverResend(IDS.htmlPresent, DOCS_RETRIEVE_EXAMPLE);
   const aRow = aPreview.body.ok ? await getEmail(aPreview.body.email.id) : null;
+  const aRowOk = aRow && aRow.ok === true ? aRow.value : null;
   check(
     "(e) the documented example's row reads back as the webhook claimed (id, sender, subject)",
     aPreview.response.status === 201 &&
-      aRow?.ok === true &&
-      aRow.value?.id === aPreview.body.email.id &&
-      aRow.value?.subject === aPreview.body.email.subject &&
-      aRow.value?.fromLabel === aPreview.body.email.from,
-    { claimed: aPreview.body.email, row: aRow?.value },
+      aRowOk !== null &&
+      aRowOk.id === aPreview.body.email.id &&
+      aRowOk.subject === aPreview.body.email.subject &&
+      aRowOk.fromLabel === aPreview.body.email.from,
+    { claimed: aPreview.body.email, row: aRowOk },
   );
   check(
     "(e) its body is the HTML text, not an absence note",
-    aRow?.ok === true && aRow.value?.body?.includes("first email") === true && !aRow.value.body.includes("[Doppel note"),
-    aRow?.value?.body,
+    aRowOk !== null && aRowOk.body.includes("first email") && !aRowOk.body.includes("[Doppel note"),
+    aRowOk?.body,
   );
   const bPreview = await deliverResend(IDS.noHtml, bUpstream);
   const bRow = bPreview.body.ok ? await getEmail(bPreview.body.email.id) : null;
+  const bRowOk = bRow && bRow.ok === true ? bRow.value : null;
   check(
     "(e) the body-less row reads back with the exact honest note as its body and snippet",
     bPreview.response.status === 201 &&
-      bRow?.ok === true &&
-      bRow.value?.body === "[Doppel note: this message had no readable text — no plain-text or HTML body came with it.]" &&
-      bRow.value?.snippet === bRow.value?.body,
-    { body: bRow?.value?.body, snippet: bRow?.value?.snippet },
+      bRowOk !== null &&
+      bRowOk.body === "[Doppel note: this message had no readable text — no plain-text or HTML body came with it.]" &&
+      bRowOk.snippet === bRowOk.body,
+    { body: bRowOk?.body, snippet: bRowOk?.snippet },
   );
   const cPreview = await deliverResend(IDS.attachmentsOnly, cUpstream);
   const cRow = cPreview.body.ok ? await getEmail(cPreview.body.email.id) : null;
+  const cRowOk = cRow && cRow.ok === true ? cRow.value : null;
   check(
     "(e) the attachment-only row reads back with the attachment-honest note",
     cPreview.response.status === 201 &&
-      cRow?.ok === true &&
-      cRow.value?.body ===
+      cRowOk !== null &&
+      cRowOk.body ===
         "[Doppel note: this message had no readable text — no plain-text or HTML body came with it, and its 2 attachments were not downloaded.]",
-    cRow?.value?.body,
+    cRowOk?.body,
   );
 
   // Leave no trace: the secrets, the connection string, the remembered ids,

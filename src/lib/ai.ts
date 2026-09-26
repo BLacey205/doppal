@@ -22,6 +22,8 @@ import { failureLogLine } from "~/lib/log-line";
 export type EmailForAi = {
   fromLabel: string;
   fromEmail: string | null;
+  /** Present on parsed/pasted input; the funnel path may leave it unset. */
+  fromName?: string | null;
   subject: string;
   body: string;
   receivedAt: string;
