@@ -21,7 +21,7 @@ import {
   type QueryExecutor,
 } from "~/lib/inbox-server";
 
-export type IngestSource = "paste" | "api" | "sample";
+export type IngestSource = "paste" | "api" | "sample" | "sms";
 
 export type IngestInput = {
   source: IngestSource;
@@ -32,6 +32,12 @@ export type IngestInput = {
   subject?: string;
   text?: string;
   receivedAt?: string;
+  /**
+   * The receiving address, when the provider carries one (the Twilio `To` — our
+   * number). Stored with the row and shown on screen, so a text message says
+   * plainly whom it arrived for. Null for mail.
+   */
+  toAddress?: string;
   /**
    * Set by a provider that could read the envelope but not the body (an
    * attachment-only forward): the honest reason there is no readable text.
@@ -158,6 +164,7 @@ export async function ingestEmail(
       aiMode: importance.mode,
       aiProvider: importance.provider,
       datesJson: JSON.stringify(storedDates),
+      toAddress: input.toAddress ?? null,
     },
     exec,
   );
@@ -195,6 +202,7 @@ export async function ingestEmail(
     aiProvider: importance.provider,
     dates: storedDates,
     draft: savedDraft.ok ? savedDraft.value : null,
+    toAddress: input.toAddress ?? null,
   };
 
   return {

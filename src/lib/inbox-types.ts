@@ -63,13 +63,16 @@ export type DraftRecord = {
 /** An email as the app knows it — everything already stringified/parsed. */
 export type StoredEmail = {
   id: string;
-  source: "paste" | "api" | "sample";
+  /** "sms" = a text message that arrived on the owner's number, never an email. */
+  source: "paste" | "api" | "sample" | "sms";
   fromName: string | null;
   fromEmail: string | null;
   fromLabel: string;
   subject: string;
   snippet: string;
   body: string;
+  /** The number it arrived on (Twilio's `To`) — null for mail. */
+  toAddress: string | null;
   receivedAt: string;
   receivedAtLabel: string;
   importance: Importance;

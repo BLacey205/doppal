@@ -137,9 +137,10 @@ export function shouldAlert(email: Pick<StoredEmail, "source" | "importance">): 
   why: string;
 } {
   // Only mail that actually arrived through the machine seam (`POST /api/inbound-email`,
-  // the Resend forwarding webhook) alerts the owner. The sample inbox and the paste box
-  // are a public demo: a visitor clicking a button must never be able to ring the owner.
-  if (email.source !== "api") {
+  // the Resend forwarding webhook, the Twilio text-message webhook) alerts the owner.
+  // The sample inbox and the paste box are a public demo: a visitor clicking a button
+  // must never be able to ring the owner.
+  if (email.source !== "api" && email.source !== "sms") {
     return { alert: false, why: `source "${email.source}" is not arrived mail, so it cannot alert` };
   }
   const { score, needsReply } = email.importance;

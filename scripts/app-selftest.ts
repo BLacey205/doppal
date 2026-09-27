@@ -94,6 +94,17 @@
  *      pipeline authenticates with the customer's key ahead of any platform
  *      env key, remove genuinely deletes, and removed/failing/undecryptable
  *      credentials all fall back to the labelled rules path.
+ * 20. the SMS channel's server half (`POST /api/inbound-sms/twilio`): the
+ *      X-Twilio-Signature check over the fixed public URL accepts an
+ *      independently computed signature and refuses unsigned, wrong-token,
+ *      tampered-body, tampered-signature and unsorted-signature requests
+ *      (typed 401, nothing stored); a genuine text goes through the same
+ *      funnel, stored with source "sms", the receiving number and a subject
+ *      that says what arrived; a Body-less payload is kept with the honest
+ *      note; a repeat is a duplicate; a refused store answers 503 and
+ *      remembers nothing; a silent memory fallback is refused; the 256 KB
+ *      cap and the per-IP rate limit hold; and the Auth Token reaches no
+ *      answer or view model. Hermetic: injected executors, no network.
  */
 import {
   extractDates,
@@ -132,6 +143,17 @@ import {
   signatureHeaders,
   verifyResendSignature,
 } from "../src/lib/inbound-providers";
+import {
+  DEFAULT_PUBLIC_ORIGIN,
+  parseTwilioParams,
+  TWILIO_ACCOUNT_SID_ENV,
+  TWILIO_AUTH_TOKEN_ENV,
+  TWILIO_WEBHOOK_BASE_URL_ENV,
+  TWILIO_WEBHOOK_PATH,
+  twilioExpectedSignature,
+  twilioWebhookUrl,
+  verifyTwilioSignature,
+} from "../src/lib/inbound-twilio";
 import {
   DEFAULT_OWNER_ALERT_EMAIL,
   DEFAULT_WORKFLOW_KEY,
@@ -2426,11 +2448,516 @@ async function main() {
     PROVIDER_CHOICES.map((choice) => choice.id),
   );
 
-  // Leave no trace: the secrets, the connection string, the remembered ids,
+  /* ---------------------------------------------------------------- *
+   * 20. The SMS channel's server half: POST /api/inbound-sms/twilio
+   * ---------------------------------------------------------------- */
+
+  console.log("\n20. Twilio text messages: signature first, one funnel, dedupe, fail-closed");
+
+  // Every line the suite prints from here to the end of the section — check
+  // output, failure details, anything — is captured, so 20h can prove the Auth
+  // Token and the Account SID reached no log line either. The originals are
+  // restored at the end of 20h.
+  const smsLogLines: string[] = [];
+  const smsLogToString = (a: unknown): string => {
+    if (typeof a === "string") return a;
+    try {
+      return JSON.stringify(a) ?? "";
+    } catch {
+      return "[unserializable]";
+    }
+  };
+  const smsCaptureLogs = (original: (...args: unknown[]) => void) =>
+    ((...args: unknown[]) => {
+      smsLogLines.push(args.map(smsLogToString).join(" "));
+      original(...args);
+    }) as typeof console.log;
+  const smsRealLog = console.log;
+  const smsRealWarn = console.warn;
+  const smsRealError = console.error;
+  console.log = smsCaptureLogs(smsRealLog);
+  console.warn = smsCaptureLogs(smsRealWarn);
+  console.error = smsCaptureLogs(smsRealError);
+
+  // Clearly test-labelled fixtures (555-01xx numbers are fictional; the token is a
+  // self-test value). Everything below runs against injected executors — no real
+  // database is ever touched, and no fabricated message is stored anywhere.
+  const TWILIO_URL = "https://selftest.twilio.example/api/inbound-sms/twilio";
+  const TWILIO_TOKEN = "selftest-auth-token-6f1d-never-shown-anywhere";
+  const TWILIO_SID = "ACselftest0000000000000000000000000";
+  const SMS_FROM = "+15550000001";
+  const SMS_TO = "+15550000002";
+
+  // Written out independently of the app's own code (the same discipline as the
+  // svixSignature helper above) so every acceptance below is a real cross-check:
+  // full URL, then POST fields sorted case-sensitively by name, name+value with
+  // no delimiter, HMAC-SHA1 keyed with the Auth Token.
+  const twilioSign = (token: string, url: string, params: Record<string, string>): string => {
+    const sorted = Object.keys(params)
+      .sort()
+      .reduce((acc, name) => `${acc}${name}${params[name]}`, "");
+    return createHmac("sha1", token).update(`${url}${sorted}`, "utf8").digest("base64");
+  };
+
+  const smsForm = (params: Record<string, string>): string => new URLSearchParams(params).toString();
+
+  const smsPost = (body: string, headers: Record<string, string> = {}) =>
+    postRequest("http://localhost/api/inbound-sms/twilio", body, {
+      "content-type": "application/x-www-form-urlencoded",
+      ...headers,
+    });
+
+  const smsSignedPost = (params: Record<string, string>, token = TWILIO_TOKEN) =>
+    smsPost(smsForm(params), { "x-twilio-signature": twilioSign(token, TWILIO_URL, params) });
+
+  const smsInsertsIn = (calls: Call[]) => calls.filter((c) => /insert into emails/i.test(c.sql));
+  const smsPlan = (sqlText: string) => {
+    if (/^create table/i.test(sqlText)) return [];
+    if (/insert into emails/i.test(sqlText)) return [{ id: 5201 }];
+    if (/select id from drafts/i.test(sqlText)) return [];
+    return [{ id: 1 }];
+  };
+
+  // Every answer in this section is kept for the leak sweep in 20f.
+  const smsAnswers: string[] = [];
+  const smsRecord = async (response: Response): Promise<Record<string, any>> => {
+    const text = await response.text();
+    smsAnswers.push(text);
+    return JSON.parse(text) as Record<string, any>;
+  };
+
+  console.log("\n20a. Not connected: no secrets, every webhook refused before anything happens");
+  delete process.env[TWILIO_AUTH_TOKEN_ENV];
+  delete process.env[TWILIO_ACCOUNT_SID_ENV];
+  delete process.env[TWILIO_WEBHOOK_BASE_URL_ENV];
+  process.env.DATABASE_URL = "postgresql://u:p@db.internal.example:5432/doppel";
+  resetStorageEvidence();
+  resetRateLimits();
+  resetIngestedProviderMessages();
+  const smsStoreA = fakeDb(smsPlan);
+
+  const smsGetUnconfigured = handleProviderWebhookGet("twilio");
+  const smsGetUnconfiguredBody = await smsRecord(smsGetUnconfigured);
+  check(
+    "20a GET is the typed 405 naming the provider",
+    smsGetUnconfigured.status === 405 &&
+      smsGetUnconfiguredBody.provider === "twilio" &&
+      smsGetUnconfiguredBody.error === "method_not_allowed" &&
+      smsGetUnconfiguredBody.connected === false,
+    { status: smsGetUnconfigured.status, body: smsGetUnconfiguredBody },
+  );
+  check(
+    "20a the route's answer names both missing secrets, in words",
+    /TWILIO_AUTH_TOKEN/.test(String(smsGetUnconfiguredBody.message)) &&
+      /TWILIO_ACCOUNT_SID/.test(String(smsGetUnconfiguredBody.message)),
+    smsGetUnconfiguredBody.message,
+  );
+
+  const smsUnsignedUnconfigured = await handleProviderWebhookPost(
+    "twilio",
+    smsPost(smsForm({ MessageSid: "SMselftest-a", From: SMS_FROM, To: SMS_TO, Body: "is anyone there?" })),
+    { exec: smsStoreA.exec },
+  );
+  const smsUnsignedUnconfiguredBody = await smsRecord(smsUnsignedUnconfigured);
+  check(
+    "20a an unsigned webhook is refused 503 provider_not_connected — expected until the secrets land, not a FAIL",
+    smsUnsignedUnconfigured.status === 503 &&
+      smsUnsignedUnconfiguredBody.error === "provider_not_connected" &&
+      smsUnsignedUnconfiguredBody.connected === false,
+    { status: smsUnsignedUnconfigured.status, body: smsUnsignedUnconfiguredBody },
+  );
+  check(
+    "20a with no base-url secret the validator's URL is the fixed server-side public origin plus the route path",
+    twilioWebhookUrl() === `${DEFAULT_PUBLIC_ORIGIN}${TWILIO_WEBHOOK_PATH}` &&
+      DEFAULT_PUBLIC_ORIGIN.startsWith("https://"),
+    twilioWebhookUrl(),
+  );
+  check("20a nothing reached the funnel while unconfigured", smsInsertsIn(smsStoreA.calls).length === 0, smsInsertsIn(smsStoreA.calls).length);
+
+  console.log("\n20b. The signature gate: a genuine signed request passes, everything else is refused");
+  process.env[TWILIO_AUTH_TOKEN_ENV] = TWILIO_TOKEN;
+  process.env[TWILIO_ACCOUNT_SID_ENV] = TWILIO_SID;
+  process.env[TWILIO_WEBHOOK_BASE_URL_ENV] = "https://selftest.twilio.example";
+  resetStorageEvidence();
+  resetRateLimits();
+  resetIngestedProviderMessages();
+  const smsStoreB = fakeDb(smsPlan);
+
+  check(
+    "20b the validator accepts a signature computed independently over the configured URL",
+    verifyTwilioSignature({
+      signature: twilioSign(TWILIO_TOKEN, TWILIO_URL, { MessageSid: "SMx", From: SMS_FROM, To: SMS_TO, Body: "cross" }),
+      url: TWILIO_URL,
+      params: { MessageSid: "SMx", From: SMS_FROM, To: SMS_TO, Body: "cross" },
+      authToken: TWILIO_TOKEN,
+    }).ok === true,
+  );
+  check(
+    "20b ...and refuses the same signature over a different URL (the URL is inside the HMAC)",
+    verifyTwilioSignature({
+      signature: twilioSign(TWILIO_TOKEN, TWILIO_URL, { MessageSid: "SMx", From: SMS_FROM, To: SMS_TO, Body: "cross" }),
+      url: "https://other.example/api/inbound-sms/twilio",
+      params: { MessageSid: "SMx", From: SMS_FROM, To: SMS_TO, Body: "cross" },
+      authToken: TWILIO_TOKEN,
+    }).ok === false,
+  );
+  check(
+    "20b the route validates against the fixed public URL, never a proxy-reconstructed one",
+    twilioWebhookUrl() === TWILIO_URL,
+    twilioWebhookUrl(),
+  );
+
+  const crossParams = { MessageSid: "SMselftest-b", From: SMS_FROM, To: SMS_TO, Body: "signature cross-check" };
+  const signedCrossBody = smsForm(crossParams);
+
+  // The cross-check the whole section rests on: the server's own signing code and
+  // the independently written signer above produce the identical signature, so an
+  // acceptance below is a genuine agreement, not one implementation talking to itself.
+  check(
+    "20b the server's own signer and the independent signer produce the identical signature",
+    twilioExpectedSignature(TWILIO_TOKEN, TWILIO_URL, crossParams) ===
+      twilioSign(TWILIO_TOKEN, TWILIO_URL, crossParams),
+  );
+
+  // The proxy case, made concrete: our origin sits behind a proxy that may rewrite
+  // scheme, host or port, so the URL the ORIGIN sees (http, localhost, a port) is
+  // not the URL the owner configured. A signature computed over that
+  // proxy-reconstructed URL must never satisfy the check — the validator is handed
+  // the fixed public URL only.
+  const PROXY_URL = "http://127.0.0.1:3000/api/inbound-sms/twilio";
+  const smsProxySigned = await handleProviderWebhookPost(
+    "twilio",
+    smsPost(signedCrossBody, { "x-twilio-signature": twilioSign(TWILIO_TOKEN, PROXY_URL, crossParams) }),
+    { exec: smsStoreB.exec },
+  );
+  const smsProxySignedBody = await smsRecord(smsProxySigned);
+  check(
+    "20b a signature computed over a proxy-reconstructed URL is refused — the validator only ever sees the fixed public URL",
+    smsProxySigned.status === 401 && smsProxySignedBody.error === "bad_signature",
+    { status: smsProxySigned.status, body: smsProxySignedBody },
+  );
+
+  const smsUnsigned = await handleProviderWebhookPost("twilio", smsPost(signedCrossBody), { exec: smsStoreB.exec });
+  const smsUnsignedBody = await smsRecord(smsUnsigned);
+  check(
+    "20b an unsigned webhook (no X-Twilio-Signature) is refused 401, nothing stored",
+    smsUnsigned.status === 401 && smsUnsignedBody.error === "missing_signature",
+    { status: smsUnsigned.status, body: smsUnsignedBody },
+  );
+
+  const smsWrongToken = await handleProviderWebhookPost(
+    "twilio",
+    smsSignedPost(crossParams, "a-token-that-is-not-ours"),
+    { exec: smsStoreB.exec },
+  );
+  const smsWrongTokenBody = await smsRecord(smsWrongToken);
+  check(
+    "20b a signature made with a different token is refused 401 bad_signature",
+    smsWrongToken.status === 401 && smsWrongTokenBody.error === "bad_signature",
+    { status: smsWrongToken.status, body: smsWrongTokenBody },
+  );
+
+  // Tampered body: the signature is genuine, the Body is not the one that was signed.
+  const smsTamperedBody = signedCrossBody.replace("cross-check", "cross-chuck");
+  const smsTampered = await handleProviderWebhookPost(
+    "twilio",
+    smsPost(smsTamperedBody, { "x-twilio-signature": twilioSign(TWILIO_TOKEN, TWILIO_URL, crossParams) }),
+    { exec: smsStoreB.exec },
+  );
+  const smsTamperedBodyResult = await smsRecord(smsTampered);
+  check(
+    "20b one byte of the body altered after signing is refused 401 bad_signature",
+    smsTampered.status === 401 && smsTamperedBodyResult.error === "bad_signature",
+    { status: smsTampered.status, body: smsTamperedBodyResult },
+  );
+
+  // Tampered signature: the body is genuine, one character of the HMAC is not.
+  const smsGoodSignature = twilioSign(TWILIO_TOKEN, TWILIO_URL, crossParams);
+  const smsFlippedSignature = (smsGoodSignature[0] === "A" ? "B" : "A") + smsGoodSignature.slice(1);
+  const smsTamperedSig = await handleProviderWebhookPost(
+    "twilio",
+    smsPost(signedCrossBody, { "x-twilio-signature": smsFlippedSignature }),
+    { exec: smsStoreB.exec },
+  );
+  const smsTamperedSigBody = await smsRecord(smsTamperedSig);
+  check(
+    "20b one character of the signature altered is refused 401 bad_signature",
+    smsTamperedSig.status === 401 && smsTamperedSigBody.error === "bad_signature",
+    { status: smsTamperedSig.status, body: smsTamperedSigBody },
+  );
+
+  // A signer that ignores Twilio's "sort by name" rule: same params on the wire,
+  // but the HMAC runs over the unsorted wire order. A correct validator sorts, so
+  // this must not pass.
+  const wireOrderParams: Record<string, string> = {
+    Body: crossParams.Body,
+    From: crossParams.From,
+    To: crossParams.To,
+    MessageSid: crossParams.MessageSid,
+  };
+  const wireOrderSignature = createHmac("sha1", TWILIO_TOKEN)
+    .update(
+      TWILIO_URL +
+        Object.keys(wireOrderParams)
+          .map((name) => `${name}${wireOrderParams[name]}`)
+          .join(""),
+      "utf8",
+    )
+    .digest("base64");
+  const smsReordered = await handleProviderWebhookPost(
+    "twilio",
+    smsPost(smsForm(wireOrderParams), { "x-twilio-signature": wireOrderSignature }),
+    { exec: smsStoreB.exec },
+  );
+  const smsReorderedBody = await smsRecord(smsReordered);
+  check(
+    "20b a signature computed over unsorted (wire-order) params is refused — the validator sorts",
+    smsReordered.status === 401 && smsReorderedBody.error === "bad_signature",
+    { status: smsReordered.status, body: smsReorderedBody },
+  );
+
+  // The acceptance proof that stores nothing: a correctly signed request with no
+  // MessageSid gets past the signature layer and is refused by the payload layer —
+  // a 400 typed missing_message_sid, not a 401. The status is the evidence.
+  const smsNoSid = await handleProviderWebhookPost(
+    "twilio",
+    smsSignedPost({ From: SMS_FROM, To: SMS_TO, Body: "no sid on purpose" }),
+    { exec: smsStoreB.exec },
+  );
+  const smsNoSidBody = await smsRecord(smsNoSid);
+  check(
+    "20b a correctly signed request with no MessageSid reaches the payload layer (400, not 401) and stores nothing",
+    smsNoSid.status === 400 && smsNoSidBody.error === "missing_message_sid",
+    { status: smsNoSid.status, body: smsNoSidBody },
+  );
+  check("20b nothing was stored by any refusal so far", smsInsertsIn(smsStoreB.calls).length === 0, smsInsertsIn(smsStoreB.calls).length);
+
+  console.log("\n20c. A genuine text goes through the one shared funnel and says it is a text");
+  const smsValidParams = {
+    MessageSid: "SMselftest-0001",
+    From: SMS_FROM,
+    To: SMS_TO,
+    Body: "Hi — are you free Friday at 9am to quote the windows?",
+  };
+  const smsAccepted = await handleProviderWebhookPost("twilio", smsSignedPost(smsValidParams), { exec: smsStoreB.exec });
+  const smsAcceptedBody = await smsRecord(smsAccepted);
+  check(
+    "20c a genuine signed webhook is accepted (2xx) and its answer claims a real store",
+    smsAccepted.status === 201 && smsAcceptedBody.ok === true && smsAcceptedBody.stored === true,
+    { status: smsAccepted.status, body: smsAcceptedBody },
+  );
+  check("20c the row landed in the store (one insert)", smsInsertsIn(smsStoreB.calls).length === 1, smsInsertsIn(smsStoreB.calls).length);
+  const smsInsertValues = smsInsertsIn(smsStoreB.calls)[0]?.values ?? [];
+  check(
+    "20c the row carries source \"sms\" — it can never masquerade as an email",
+    smsInsertValues[0] === "sms",
+    smsInsertValues[0],
+  );
+  check(
+    "20c the row says plainly which number it arrived on (to_address)",
+    smsInsertValues[15] === SMS_TO,
+    smsInsertValues[15],
+  );
+  check(
+    "20c the subject says what arrived, from where, in words",
+    smsInsertValues[4] === `Text message to ${SMS_TO}` && smsInsertValues[3] === SMS_FROM,
+    { subject: smsInsertValues[4], fromLabel: smsInsertValues[3] },
+  );
+  check(
+    "20c the text is triaged by the same funnel (score, draft, dates in the answer)",
+    typeof smsAcceptedBody.email?.importance?.score === "number" && smsAcceptedBody.email?.draft !== null,
+    smsAcceptedBody.email?.importance,
+  );
+
+  console.log("\n20d. A Body that is missing or truncated is kept, not lost; a repeat is a duplicate");
+  const smsNoBodyParams = { MessageSid: "SMselftest-0002", From: SMS_FROM, To: SMS_TO };
+  const smsNoBody = await handleProviderWebhookPost("twilio", smsSignedPost(smsNoBodyParams), { exec: smsStoreB.exec });
+  check(
+    "20d a signed webhook with no Body param is kept (201), not refused",
+    smsNoBody.status === 201 && (await smsRecord(smsNoBody)).ok === true,
+    smsNoBody.status,
+  );
+  const smsEmptyParams = { MessageSid: "SMselftest-0003", From: SMS_FROM, To: SMS_TO, Body: "   " };
+  const smsEmpty = await handleProviderWebhookPost("twilio", smsSignedPost(smsEmptyParams), { exec: smsStoreB.exec });
+  check(
+    "20d a Body of whitespace is kept the same way",
+    smsEmpty.status === 201 && (await smsRecord(smsEmpty)).ok === true,
+    smsEmpty.status,
+  );
+  const smsBodylessInserts = smsInsertsIn(smsStoreB.calls).slice(1);
+  check(
+    "20d both body-less rows carry the honest Doppel note, still labelled a text",
+    smsBodylessInserts.length === 2 &&
+      smsBodylessInserts.every(
+        (c) =>
+          String(c.values[0]) === "sms" &&
+          String(c.values[6]).startsWith("[Doppel note: this message had no readable text") &&
+          String(c.values[6]).includes("no text body came with it"),
+      ),
+    smsBodylessInserts.map((c) => [c.values[0], String(c.values[6]).slice(0, 60)]),
+  );
+
+  const smsRepeat = await handleProviderWebhookPost("twilio", smsSignedPost(smsValidParams), { exec: smsStoreB.exec });
+  const smsRepeatBody = await smsRecord(smsRepeat);
+  check(
+    "20d the exact same signed webhook again is answered duplicate with a 200",
+    smsRepeat.status === 200 && smsRepeatBody.duplicate === true && smsRepeatBody.ok === true,
+    { status: smsRepeat.status, body: smsRepeatBody },
+  );
+  check(
+    "20d ...and the store still holds exactly one row for that MessageSid",
+    smsInsertsIn(smsStoreB.calls).length === 3,
+    smsInsertsIn(smsStoreB.calls).length,
+  );
+
+  console.log("\n20e. Store failures: the id is remembered only after a real store");
+  const smsRefusedStore = fakeDb(smsPlan, { throwOn: "insert" });
+  const smsRefusedParams = {
+    MessageSid: "SMselftest-0004",
+    From: SMS_FROM,
+    To: SMS_TO,
+    Body: "will the store keep me?",
+  };
+  const smsRefused = await handleProviderWebhookPost("twilio", smsSignedPost(smsRefusedParams), {
+    exec: smsRefusedStore.exec,
+  });
+  const smsRefusedBody = await smsRecord(smsRefused);
+  check(
+    "20e a refused store is NOT answered as a duplicate — 503 store_failed, the kind Twilio retries",
+    smsRefused.status === 503 && smsRefusedBody.error === "store_failed" && smsRefusedBody.duplicate !== true,
+    { status: smsRefused.status, body: smsRefusedBody },
+  );
+  check("20e the funnel really ran (one insert attempt reached the store)", smsInsertsIn(smsRefusedStore.calls).length === 1, smsInsertsIn(smsRefusedStore.calls).length);
+
+  const smsRecovered = await handleProviderWebhookPost("twilio", smsSignedPost(smsRefusedParams), {
+    exec: smsStoreB.exec,
+  });
+  const smsRecoveredBody = await smsRecord(smsRecovered);
+  check(
+    "20e the retry with the store recovered is accepted and stored — the id was remembered by no one",
+    smsRecovered.status === 201 && smsRecoveredBody.duplicate !== true,
+    { status: smsRecovered.status, body: smsRecoveredBody },
+  );
+  const smsRepeatAfterRecovery = await handleProviderWebhookPost("twilio", smsSignedPost(smsRefusedParams), {
+    exec: smsStoreB.exec,
+  });
+  check(
+    "20e its own repeat is now the duplicate (200), still one row for the pair",
+    smsRepeatAfterRecovery.status === 200 && (await smsRecord(smsRepeatAfterRecovery)).duplicate === true,
+    smsRepeatAfterRecovery.status,
+  );
+
+  console.log("\n20f. A silent memory fallback while a database is configured is refused, not swallowed");
+  process.env.DATABASE_URL = "not a connection string";
+  resetStorageEvidence();
+  resetRateLimits();
+  resetIngestedProviderMessages();
+  const smsFellBack = await handleProviderWebhookPost(
+    "twilio",
+    smsSignedPost({ MessageSid: "SMselftest-0005", From: SMS_FROM, To: SMS_TO, Body: "memory fallback on purpose" }),
+  );
+  const smsFellBackBody = await smsRecord(smsFellBack);
+  check(
+    "20f the funnel's 2xx is replaced with an honest 503 store_failed",
+    smsFellBack.status === 503 && smsFellBackBody.error === "store_failed" && smsFellBackBody.stored === false,
+    { status: smsFellBack.status, body: smsFellBackBody },
+  );
+  const smsFellBackRepeat = await handleProviderWebhookPost(
+    "twilio",
+    smsSignedPost({ MessageSid: "SMselftest-0005", From: SMS_FROM, To: SMS_TO, Body: "memory fallback on purpose" }),
+  );
+  check(
+    "20f the id was remembered by no one: the retry is answered exactly the same, never 'duplicate'",
+    smsFellBackRepeat.status === 503 && (await smsRecord(smsFellBackRepeat)).duplicate !== true,
+    smsFellBackRepeat.status,
+  );
+
+  console.log("\n20g. Size cap and rate limit — the same guard every intake route runs");
+  process.env.DATABASE_URL = "postgresql://u:p@db.internal.example:5432/doppel";
+  resetStorageEvidence();
+  resetRateLimits();
+  resetIngestedProviderMessages();
+  const smsStoreC = fakeDb(smsPlan);
+  const smsHugeBody = smsForm({
+    MessageSid: "SMselftest-0006",
+    From: SMS_FROM,
+    To: SMS_TO,
+    Body: "x".repeat(MAX_INBOUND_BODY_BYTES + 1024),
+  });
+  const smsOversize = await handleProviderWebhookPost("twilio", smsPost(smsHugeBody), { exec: smsStoreC.exec });
+  const smsOversizeBody = await smsRecord(smsOversize);
+  check(
+    `20g a body over ${Math.round(MAX_INBOUND_BODY_BYTES / 1024)} KB is refused 413, before anything is read`,
+    smsOversize.status === 413 && /bigger than Doppel will accept/i.test(String(smsOversizeBody.message)),
+    { status: smsOversize.status, body: smsOversizeBody },
+  );
+
+  // 30 requests a minute per address. Thirty unsigned refusals exhaust the bucket;
+  // the 31st — a genuine, correctly signed message — is refused anyway. The flood
+  // guard does not care how real the caller looked.
+  for (let i = 0; i < RATE_LIMIT_MAX_REQUESTS; i++) {
+    await handleProviderWebhookPost(
+      "twilio",
+      smsPost(smsForm({ MessageSid: `SMselftest-flood-${i}`, From: SMS_FROM, To: SMS_TO, Body: "flood" })),
+      { exec: smsStoreC.exec },
+    );
+  }
+  const smsFlood = await handleProviderWebhookPost(
+    "twilio",
+    smsSignedPost({ MessageSid: "SMselftest-flood-final", From: SMS_FROM, To: SMS_TO, Body: "genuine but one too many" }),
+    { exec: smsStoreC.exec },
+  );
+  const smsFloodBody = await smsRecord(smsFlood);
+  check(
+    `20g the request after ${RATE_LIMIT_MAX_REQUESTS} in a minute is 429 rate_limited — even a genuine signed one`,
+    smsFlood.status === 429 && smsFloodBody.error === "rate_limited",
+    { status: smsFlood.status, body: smsFloodBody },
+  );
+  check("20g not one flood request stored anything", smsInsertsIn(smsStoreC.calls).length === 0, smsInsertsIn(smsStoreC.calls).length);
+
+  console.log("\n20h. Leak sweep: the Auth Token reaches no answer, no view model, no rendered HTML");
+  const smsStatusViews = channelStatuses().map((status) => JSON.stringify(status)).join("\n");
+  check(
+    "20h the token appears in no stored answer",
+    smsAnswers.every((text) => !text.includes(TWILIO_TOKEN)),
+    smsAnswers.findIndex((text) => text.includes(TWILIO_TOKEN)),
+  );
+  check(
+    "20h the token appears in no channel view model",
+    !smsStatusViews.includes(TWILIO_TOKEN) && !smsStatusViews.includes(TWILIO_SID),
+  );
+  check(
+    "20h the token appears in no parse output the funnel ever saw",
+    !JSON.stringify(parseTwilioParams(smsForm(smsValidParams))).includes(TWILIO_TOKEN),
+  );
+
+  // The rendered surface: the connections card as /app actually renders it, with
+  // the Twilio secrets SET (the worst case for a leak) while this renders.
+  const smsCardHtml = renderToStaticMarkup(
+    React.createElement(ConnectionsSection, { channels: channelStatuses().map(channelView) }),
+  );
+  check(
+    "20h the token and the SID appear in no rendered channel card HTML",
+    !smsCardHtml.includes(TWILIO_TOKEN) && !smsCardHtml.includes(TWILIO_SID),
+  );
+  check(
+    "20h the secrets appear in no log line this section printed (capture covers every console call since 20a)",
+    !smsLogLines.some((line) => line.includes(TWILIO_TOKEN) || line.includes(TWILIO_SID)),
+    smsLogLines.findIndex((line) => line.includes(TWILIO_TOKEN) || line.includes(TWILIO_SID)),
+  );
+
+  // Restore the suite's own console now that the sweep is done.
+  console.log = smsRealLog;
+  console.warn = smsRealWarn;
+  console.error = smsRealError;
+
   // Leave no trace: the secrets, the connection string, the remembered ids,
   // the rate-limit bucket, the channel evidence and the storage evidence.
   delete process.env[RESEND_WEBHOOK_SECRET_ENV];
   delete process.env[RESEND_API_KEY_ENV];
+  delete process.env[TWILIO_AUTH_TOKEN_ENV];
+  delete process.env[TWILIO_ACCOUNT_SID_ENV];
+  delete process.env[TWILIO_WEBHOOK_BASE_URL_ENV];
   delete process.env.DATABASE_URL;
   resetIngestedProviderMessages();
   resetRateLimits();

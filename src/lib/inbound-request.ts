@@ -34,6 +34,10 @@ type InboundFields = {
   receivedAt?: string;
   /** Honest reason there is no readable body (provider path only). */
   bodyNote?: string;
+  /** The receiving address, when the provider carries one (Twilio's `To`). */
+  toAddress?: string;
+  /** What arrived, when it is not an email (the Twilio path sets "sms"). */
+  source?: "sms";
   /** Set when the message came from a provider webhook, so the answer says which. */
   provider?: string;
 };
@@ -114,12 +118,13 @@ export async function ingestToOutcome(
     const { ingestEmail } = await import("~/lib/ingest");
     const result = await ingestEmail(
       {
-        source: "api",
+        source: input.source === "sms" ? "sms" : "api",
         from: text(input.from),
         subject: text(input.subject),
         text: text(input.text),
         receivedAt: text(input.receivedAt) || undefined,
         bodyNote: text(input.bodyNote) || undefined,
+        toAddress: text(input.toAddress) || undefined,
       },
       options.exec,
     );

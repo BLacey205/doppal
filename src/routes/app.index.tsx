@@ -346,6 +346,7 @@ function AppInbox() {
                       {email.snippet}
                     </span>
                     <span className="mt-2.5 flex flex-wrap items-center gap-1.5">
+                      {email.source === "sms" ? <Chip tone="violet">Text message</Chip> : null}
                       {email.importance.needsReply ? <Chip tone="indigo">Needs a reply</Chip> : null}
                       {email.dates.length > 0 ? (
                         <Chip tone="violet">

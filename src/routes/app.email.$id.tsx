@@ -88,8 +88,12 @@ function EmailDetail() {
               <h1 className="mt-2 text-2xl font-bold tracking-tight text-slate-900 sm:text-3xl">{email.subject}</h1>
               <p className="mt-2 text-sm text-slate-600">
                 <span className="font-medium text-slate-800">{email.fromLabel}</span> · {email.receivedAtLabel}
+                {email.toAddress ? (
+                  <span className="text-slate-500"> · arrived on {email.toAddress}</span>
+                ) : null}
               </p>
               <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                {email.source === "sms" ? <Chip tone="violet">Text message</Chip> : null}
                 {email.importance.needsReply ? <Chip tone="indigo">Needs a reply</Chip> : <Chip>No reply needed</Chip>}
                 {email.dates.length > 0 ? (
                   <Chip tone="violet">

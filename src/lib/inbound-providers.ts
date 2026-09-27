@@ -31,6 +31,7 @@
 
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { noteProviderFailure, noteProviderMailStored } from "~/lib/channel-evidence";
+import { twilioProvider } from "~/lib/inbound-twilio";
 import {
   failureResponse,
   intakePreflight,
@@ -60,6 +61,17 @@ export type InboundMessage = {
    * can say so plainly. An explanation of an absence, never content.
    */
   bodyNote?: string;
+  /**
+   * The receiving address, when the provider carries one (the Twilio `To` — our
+   * number). Stored with the row so a text message says plainly whom it arrived for.
+   */
+  toAddress?: string;
+  /**
+   * What arrived, when it is not an email. The Twilio provider sets "sms" so the
+   * stored row and the /app screens say "Text message" instead of presenting a
+   * text as mail. Absent → the funnel's normal mail source.
+   */
+  source?: "sms";
   /** Provider-side id, so a retried webhook doesn't ingest the same mail twice. */
   providerMessageId: string | null;
 };
@@ -78,6 +90,12 @@ export type InboundProvider = {
   readonly configureHint: string;
   connection(): { connected: true } | { connected: false; message: string };
   read(request: Request, rawBody: string): Promise<ProviderRead>;
+  /**
+   * Called when a message was read but no store kept it (the 503 store_failed
+   * path). Providers that want the channel's evidence to say "failing" declare
+   * this; Resend doesn't — its behaviour is unchanged, Twilio records the event.
+   */
+  onStoreFailed?: () => void;
 };
 
 function env(name: string): string | null {
@@ -418,6 +436,7 @@ export const resendProvider: InboundProvider = {
 
 export const PROVIDERS: Record<string, InboundProvider> = {
   [resendProvider.name]: resendProvider,
+  [twilioProvider.name]: twilioProvider,
 };
 
 /**
@@ -563,6 +582,9 @@ export async function handleProviderWebhookPost(
       // The funnel answered 2xx but the message is not genuinely kept (a memory
       // fallback while a database is configured). Say so honestly, non-2xx, so
       // the provider retries into a store that can actually keep the message.
+      // Providers that want the channel evidence to say "failing" say so here;
+      // the hook is optional, so Resend's behaviour is untouched.
+      provider.onStoreFailed?.();
       return jsonResponse(
         {
           ok: false,

@@ -176,6 +176,8 @@ export type NewEmailRow = {
   aiMode: string;
   aiProvider: string;
   datesJson: string;
+  /** The number a text message arrived on (Twilio's `To`); null for mail. */
+  toAddress: string | null;
 };
 
 export type NewEventRow = {
@@ -351,6 +353,10 @@ export async function ensureSchema(db: QueryExecutor): Promise<void> {
       created_at timestamptz not null default now()
     )
   `;
+  // The number a text message arrived on (the SMS channel's `To`). Idempotent, so
+  // an existing database gains the column on first write and a fresh one has it
+  // from the create above.
+  await db`alter table emails add column if not exists to_address text`;
   schemaReady = true;
 }
 
@@ -385,6 +391,7 @@ function rowToEmail(row: Row, addedIds: Set<string>): StoredEmail {
     subject: str(row.subject, "(no subject)"),
     snippet: str(row.snippet),
     body: str(row.body),
+    toAddress: row.to_address === null || row.to_address === undefined ? null : str(row.to_address),
     receivedAt,
     receivedAtLabel: formatWhen(receivedAt, false),
     importance: {
@@ -430,6 +437,7 @@ export async function insertEmail(
       subject: row.subject,
       snippet: row.snippet,
       body: row.body,
+      toAddress: row.toAddress,
       receivedAt: row.receivedAt,
       receivedAtLabel: formatWhen(row.receivedAt, false),
       importance: { score: row.score, reason: row.reason, needsReply: row.needsReply },
@@ -446,11 +454,12 @@ export async function insertEmail(
       insert into emails (
         source, from_name, from_email, from_label, subject, snippet, body, raw,
         received_at, importance_score, importance_reason, needs_reply, ai_mode,
-        ai_provider, dates_json
+        ai_provider, dates_json, to_address
       ) values (
         ${row.source}, ${row.fromName}, ${row.fromEmail}, ${row.fromLabel}, ${row.subject},
         ${row.snippet}, ${row.body}, ${row.raw}, ${row.receivedAt}::timestamptz, ${row.score},
-        ${row.reason}, ${row.needsReply}, ${row.aiMode}, ${row.aiProvider}, ${row.datesJson}
+        ${row.reason}, ${row.needsReply}, ${row.aiMode}, ${row.aiProvider}, ${row.datesJson},
+        ${row.toAddress}
       )
       returning id
     `;
